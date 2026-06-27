@@ -272,7 +272,7 @@ async def get_user(user_id):
                 'messages': deserialize_messages(row[3]),
                 'read_ids': json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
             }
-        elif isinstance(row, dict)):
+        elif isinstance(row, dict):
             user_data = {
                 'email': str(extract_value(row.get('email', ''))),
                 'token': str(extract_value(row.get('token', ''))),
