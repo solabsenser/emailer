@@ -13,6 +13,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 import os
+from bs4 import BeautifulSoup  # <-- ДОБАВЛЯЕМ
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -102,33 +103,16 @@ def decode_header_value(value):
         return value
 
 def decode_quoted_printable(text):
-    """Полностью декодирует quoted-printable и убирает все артефакты"""
     if not text:
         return ''
     try:
-        # 1. Убираем экранирование обратных слэшей перед специальными символами
-        text = re.sub(r'\\([-.=])', r'\1', text)
-        
-        # 2. Декодируем quoted-printable
+        text = text.replace('\\-', '-').replace('\\.', '.').replace('\\=', '=')
         decoded = quopri.decodestring(text.encode('utf-8'))
-        
-        # 3. Пробуем разные кодировки
         for encoding in ['utf-8', 'windows-1251', 'koi8-r']:
             try:
                 result = decoded.decode(encoding, errors='ignore')
-                # 4. Убираем оставшиеся '=' в конце строк
                 result = re.sub(r'=\s*\n', ' ', result)
                 result = re.sub(r'=\s*$', ' ', result)
-                
-                # 5. Убираем все артефакты quoted-printable
-                result = re.sub(r'=([0-9A-F]{2})', lambda m: bytes.fromhex(m.group(1)).decode('utf-8', errors='ignore'), result, flags=re.IGNORECASE)
-                
-                # 6. Убираем мусорные последовательности
-                result = re.sub(r'=\\n', '', result)
-                result = re.sub(r'\\n', ' ', result)
-                result = re.sub(r'\\r', ' ', result)
-                result = re.sub(r'\s+', ' ', result)
-                
                 return result
             except:
                 continue
@@ -151,53 +135,37 @@ def extract_links_from_html(html):
     return clean
 
 def clean_text_from_email(html):
-    """Очищает HTML от CSS, стилей и quoted-printable мусора"""
+    """Парсит HTML и извлекает чистый текст через BeautifulSoup"""
     if not html:
         return ''
     
-    # 1. Декодируем quoted-printable
-    html = decode_quoted_printable(html)
-    
-    # 2. Убираем CSS блоки
-    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
-    
-    # 3. Убираем все HTML теги
-    html = re.sub(r'<[^>]+>', ' ', html)
-    
-    # 4. Убираем CSS свойства
-    html = re.sub(r'\{[^}]*\}', '', html)
-    
-    # 5. Убираем множественные пробелы
-    html = re.sub(r'\s+', ' ', html)
-    
-    # 6. Убираем мусорные последовательности
-    html = re.sub(r'=20', ' ', html)
-    html = re.sub(r'=3D', '=', html)
-    html = re.sub(r'=2E', '.', html)
-    html = re.sub(r'=2D', '-', html)
-    html = re.sub(r'=09', ' ', html)
-    html = re.sub(r'=0A', '\n', html)
-    html = re.sub(r'=0D', '', html)
-    
-    # 7. Убираем Content-Type и другие заголовки
-    html = re.sub(r'Content-Type:[^\s]+', '', html, flags=re.IGNORECASE)
-    html = re.sub(r'Content-Transfer-Encoding:[^\s]+', '', html, flags=re.IGNORECASE)
-    
-    # 8. Убираем оставшиеся экранированные символы
-    html = re.sub(r'\\([-.=])', r'\1', html)
-    
-    # 9. Убираем всё, что похоже на артефакты quoted-printable
-    html = re.sub(r'----=_mimepart_[a-f0-9]+', '', html)
-    html = re.sub(r'----[=_][a-zA-Z0-9]+', '', html)
-    
-    # 10. Убираем множественные пробелы и переносы
-    html = re.sub(r'\s+', ' ', html)
-    
-    # 11. Декодируем HTML-сущности
-    import html as html_parser
-    html = html_parser.unescape(html)
-    
-    return html.strip()
+    try:
+        # Декодируем quoted-printable
+        html = decode_quoted_printable(html)
+        
+        # Парсим HTML через BeautifulSoup
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Убираем все скрипты и стили
+        for script in soup(["script", "style"]):
+            script.decompose()
+        
+        # Получаем текст
+        text = soup.get_text()
+        
+        # Убираем множественные пробелы и переносы
+        text = re.sub(r'\s+', ' ', text)
+        
+        return text.strip()
+    except Exception as e:
+        logger.error(f"BeautifulSoup error: {e}")
+        # Fallback
+        html = decode_quoted_printable(html)
+        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<[^>]+>', ' ', html)
+        html = re.sub(r'\{[^}]*\}', '', html)
+        html = re.sub(r'\s+', ' ', html)
+        return html.strip()
 
 def find_confirmation_link(links):
     if not links:
@@ -416,7 +384,7 @@ async def check_mailcat(account):
                         html = email_data.get('email', {}).get('html', '')
                         text = email_data.get('email', {}).get('text', '')
                         
-                        # Очищаем текст от мусора
+                        # Очищаем текст через BeautifulSoup
                         clean_text = clean_text_from_email(html)
                         if not clean_text:
                             clean_text = clean_text_from_email(text)
