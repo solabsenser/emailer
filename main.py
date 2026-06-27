@@ -27,28 +27,21 @@ if not TURSO_URL or not TURSO_TOKEN:
     logger.error("❌ TURSO_URL or TURSO_TOKEN not set")
     exit(1)
 
-# Убеждаемся, что в URL есть порт
-if "://" in TURSO_URL:
-    # Если нет порта, добавляем :443 для HTTPS
-    if ":443" not in TURSO_URL and ":8080" not in TURSO_URL:
-        TURSO_URL = TURSO_URL.replace("https://", "https://")
-        if not TURSO_URL.endswith("/"):
-            TURSO_URL = TURSO_URL + "/"
-        # Turso использует порт 443 для HTTPS
-        logger.info(f"✅ Using Turso URL: {TURSO_URL}")
+# Конвертируем libsql:// в https://
+if TURSO_URL.startswith("libsql://"):
+    TURSO_URL = TURSO_URL.replace("libsql://", "https://")
+    logger.info(f"✅ Converted to HTTPS: {TURSO_URL}")
+
+# Добавляем порт если нет
+if ":443" not in TURSO_URL and ":8080" not in TURSO_URL:
+    TURSO_URL = TURSO_URL.replace("https://", "https://")
+    TURSO_URL = TURSO_URL.rstrip("/") + ":443"
 
 # ===== TURSO HTTP API =====
 class TursoClient:
     def __init__(self, url, token):
         self.url = url
         self.token = token
-        # Парсим URL для получения хоста и порта
-        if url.startswith("https://"):
-            self.host = url.replace("https://", "").split("/")[0]
-            self.port = 443
-        else:
-            self.host = url.replace("http://", "").split("/")[0]
-            self.port = 80
     
     async def execute(self, sql, params=None):
         """Выполняет SQL через HTTP API"""
@@ -61,13 +54,13 @@ class TursoClient:
                 "statements": [{"sql": sql, "args": params or []}]
             }
             
-            # Используем полный URL с портом
-            full_url = self.url
-            if not full_url.endswith("/"):
-                full_url += "/"
-            full_url += "v1/execute"
+            # Правильный URL для Turso API
+            base_url = self.url.replace(":443", "")
+            full_url = f"{base_url.rstrip('/')}/v1/execute"
             
-            async with session.post(full_url, headers=headers, json=payload) as resp:
+            logger.debug(f"Executing: {sql[:50]}...")
+            
+            async with session.post(full_url, headers=headers, json=payload, ssl=True) as resp:
                 if resp.status != 200:
                     error = await resp.text()
                     raise Exception(f"Turso error {resp.status}: {error}")
