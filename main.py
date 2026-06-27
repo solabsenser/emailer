@@ -10,7 +10,6 @@ from aiosmtpd.controller import Controller
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils import executor
 from dotenv import load_dotenv
 import os
 
@@ -100,47 +99,88 @@ def get_main_menu():
     )
     return keyboard
 
-async def edit_or_reply(message, text, reply_markup=None, parse_mode='Markdown'):
-    """Редактирует сообщение если возможно, иначе отправляет новое"""
+# Храним ID последнего сообщения для каждого пользователя
+user_last_message = {}
+
+async def update_message(user_id, text, reply_markup=None, parse_mode='Markdown'):
+    """Редактирует последнее сообщение пользователя или отправляет новое если его нет"""
+    msg_id = user_last_message.get(user_id)
+    
     try:
-        await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-    except:
-        await message.reply(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        if msg_id:
+            await bot.edit_message_text(
+                text,
+                chat_id=user_id,
+                message_id=msg_id,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
+        else:
+            sent = await bot.send_message(
+                user_id,
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
+            user_last_message[user_id] = sent.message_id
+    except Exception as e:
+        # Если не удалось отредактировать (сообщение старое) - отправляем новое
+        if "message to edit not found" in str(e) or "message is not modified" in str(e):
+            sent = await bot.send_message(
+                user_id,
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
+            user_last_message[user_id] = sent.message_id
+        else:
+            logging.error(f"Update error: {e}")
 
 @dp.message_handler(commands=['start', 'menu'])
 async def start(message: types.Message):
-    await message.reply(
+    user_id = message.from_user.id
+    user_last_message[user_id] = message.message_id
+    
+    await update_message(
+        user_id,
         "📧 **Временная почта**\n\n"
         "Создавайте email и получайте письма в Telegram\n"
         f"🌐 Домен: `{DOMAIN}`",
-        parse_mode='Markdown',
         reply_markup=get_main_menu()
     )
 
 @dp.message_handler()
 async def any_message(message: types.Message):
-    await message.reply(
+    user_id = message.from_user.id
+    user_last_message[user_id] = message.message_id
+    
+    await update_message(
+        user_id,
         "📧 Используйте кнопки ниже:",
         reply_markup=get_main_menu()
     )
 
 @dp.callback_query_handler(lambda c: c.data == "create")
 async def create(callback: types.CallbackQuery):
-    user_id = str(callback.from_user.id)
+    user_id = callback.from_user.id
+    await callback.answer()
     
-    if len(user_emails[user_id]) >= 10:
-        await callback.answer("❌ Максимум 10 ящиков", show_alert=True)
+    if len(user_emails[str(user_id)]) >= 10:
+        await update_message(
+            user_id,
+            "❌ **Максимум 10 ящиков**\n\nУдалите один из существующих",
+            reply_markup=get_main_menu()
+        )
         return
     
     for _ in range(10):
         email = generate_email()
         if email not in mailboxes:
-            mailboxes[email] = {'user_id': user_id, 'messages': []}
-            user_emails[user_id].append(email)
+            mailboxes[email] = {'user_id': str(user_id), 'messages': []}
+            user_emails[str(user_id)].append(email)
             
-            await callback.answer("✅ Создано!")
-            await edit_or_reply(
-                callback.message,
+            await update_message(
+                user_id,
                 f"✅ **Создан email:**\n`{email}`\n\n"
                 f"📩 Отправляйте письма на этот адрес\n"
                 f"🗑 Удалить можно через меню",
@@ -148,18 +188,22 @@ async def create(callback: types.CallbackQuery):
             )
             return
     
-    await callback.answer("❌ Ошибка", show_alert=True)
+    await update_message(
+        user_id,
+        "❌ **Ошибка создания**\nПопробуйте снова",
+        reply_markup=get_main_menu()
+    )
 
 @dp.callback_query_handler(lambda c: c.data == "list")
 async def list_emails(callback: types.CallbackQuery):
-    user_id = str(callback.from_user.id)
-    emails = [e for e in user_emails.get(user_id, []) if e in mailboxes]
-    
+    user_id = callback.from_user.id
     await callback.answer()
     
+    emails = [e for e in user_emails.get(str(user_id), []) if e in mailboxes]
+    
     if not emails:
-        await edit_or_reply(
-            callback.message,
+        await update_message(
+            user_id,
             "📭 **У вас нет ящиков**\n\nНажмите «Создать почту»",
             reply_markup=get_main_menu()
         )
@@ -170,18 +214,18 @@ async def list_emails(callback: types.CallbackQuery):
         msg_count = len(mailboxes[email].get('messages', []))
         text += f"• `{email}` — 📨 {msg_count} писем\n"
     
-    await edit_or_reply(callback.message, text, reply_markup=get_main_menu())
+    await update_message(user_id, text, reply_markup=get_main_menu())
 
 @dp.callback_query_handler(lambda c: c.data == "check")
 async def check(callback: types.CallbackQuery):
-    user_id = str(callback.from_user.id)
-    emails = [e for e in user_emails.get(user_id, []) if e in mailboxes]
-    
+    user_id = callback.from_user.id
     await callback.answer()
     
+    emails = [e for e in user_emails.get(str(user_id), []) if e in mailboxes]
+    
     if not emails:
-        await edit_or_reply(
-            callback.message,
+        await update_message(
+            user_id,
             "📭 **Нет ящиков**\n\nНажмите «Создать почту»",
             reply_markup=get_main_menu()
         )
@@ -196,8 +240,8 @@ async def check(callback: types.CallbackQuery):
         ))
     keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu"))
     
-    await edit_or_reply(
-        callback.message,
+    await update_message(
+        user_id,
         "📨 **Выберите ящик для просмотра:**",
         reply_markup=keyboard
     )
@@ -205,18 +249,22 @@ async def check(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("view_"))
 async def view_mail(callback: types.CallbackQuery):
     email = callback.data.replace("view_", "")
-    user_id = str(callback.from_user.id)
+    user_id = callback.from_user.id
+    await callback.answer()
     
-    if email not in mailboxes or mailboxes[email].get('user_id') != user_id:
-        await callback.answer("❌ Не найден", show_alert=True)
+    if email not in mailboxes or mailboxes[email].get('user_id') != str(user_id):
+        await update_message(
+            user_id,
+            "❌ **Ящик не найден**",
+            reply_markup=get_main_menu()
+        )
         return
     
     messages = mailboxes[email].get('messages', [])
     
     if not messages:
-        await callback.answer()
-        await edit_or_reply(
-            callback.message,
+        await update_message(
+            user_id,
             f"📭 **Писем для `{email}` нет**",
             reply_markup=get_main_menu()
         )
@@ -243,19 +291,18 @@ async def view_mail(callback: types.CallbackQuery):
         InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu")
     )
     
-    await callback.answer()
-    await edit_or_reply(callback.message, text, reply_markup=keyboard)
+    await update_message(user_id, text, reply_markup=keyboard)
 
 @dp.callback_query_handler(lambda c: c.data == "delete")
 async def delete_menu(callback: types.CallbackQuery):
-    user_id = str(callback.from_user.id)
-    emails = [e for e in user_emails.get(user_id, []) if e in mailboxes]
-    
+    user_id = callback.from_user.id
     await callback.answer()
     
+    emails = [e for e in user_emails.get(str(user_id), []) if e in mailboxes]
+    
     if not emails:
-        await edit_or_reply(
-            callback.message,
+        await update_message(
+            user_id,
             "📭 **Нет ящиков для удаления**",
             reply_markup=get_main_menu()
         )
@@ -270,8 +317,8 @@ async def delete_menu(callback: types.CallbackQuery):
         ))
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="back_to_menu"))
     
-    await edit_or_reply(
-        callback.message,
+    await update_message(
+        user_id,
         "⚠️ **Выберите ящик для удаления:**\n\n"
         "Ящик и все письма будут удалены безвозвратно",
         reply_markup=keyboard
@@ -280,27 +327,33 @@ async def delete_menu(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("del_"))
 async def delete_confirm(callback: types.CallbackQuery):
     email = callback.data.replace("del_", "")
-    user_id = str(callback.from_user.id)
+    user_id = callback.from_user.id
+    await callback.answer()
     
-    if email in mailboxes and mailboxes[email].get('user_id') == user_id:
-        user_emails[user_id].remove(email)
+    if email in mailboxes and mailboxes[email].get('user_id') == str(user_id):
+        user_emails[str(user_id)].remove(email)
         del mailboxes[email]
-        await callback.answer("✅ Удалён!")
-        await edit_or_reply(
-            callback.message,
+        
+        await update_message(
+            user_id,
             f"🗑 **Ящик удалён:**\n`{email}`",
             reply_markup=get_main_menu()
         )
     else:
-        await callback.answer("❌ Не найден", show_alert=True)
+        await update_message(
+            user_id,
+            "❌ **Ящик не найден**",
+            reply_markup=get_main_menu()
+        )
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_menu")
 async def back_to_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
     await callback.answer()
-    await edit_or_reply(
-        callback.message,
-        "📧 **Главное меню**\n\n"
-        "Выберите действие:",
+    
+    await update_message(
+        user_id,
+        "📧 **Главное меню**\n\nВыберите действие:",
         reply_markup=get_main_menu()
     )
 
