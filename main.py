@@ -302,6 +302,10 @@ async def create_mailcat_mailbox():
             }
 
 async def check_mailcat(account):
+    # Убеждаемся, что messages — это список
+    if 'messages' not in account or not isinstance(account['messages'], list):
+        account['messages'] = []
+    
     async with aiohttp.ClientSession() as session:
         headers = {"Authorization": f"Bearer {account['token']}"}
         async with session.get(f"{MAILCAT_API}/inbox", headers=headers) as resp:
@@ -428,8 +432,11 @@ async def show_main_screen(user_id):
         )
         return
     
-    messages = account.get('messages', [])
-    valid_messages = [m for m in messages if isinstance(m, dict)]
+    # Нормализуем messages в список
+    if 'messages' not in account or not isinstance(account['messages'], list):
+        account['messages'] = []
+    
+    valid_messages = [m for m in account['messages'] if isinstance(m, dict)]
     msg_count = len(valid_messages)
     codes = [m.get('code') for m in valid_messages if m.get('code')]
     code_count = len(codes)
@@ -506,16 +513,19 @@ async def check_handler(message: types.Message):
         await show_main_screen(user_id)
         return
     
+    # Нормализуем messages в список
+    if 'messages' not in account or not isinstance(account['messages'], list):
+        account['messages'] = []
+    
     await send_bot_message(user_id, "🔄 **Проверяю почту...**", None)
     
     try:
         new = await check_mailcat(account)
         if new:
-            account.setdefault('messages', []).extend(new)
+            account['messages'].extend(new)
             await save_user(user_id, account)
         
-        messages = account.get('messages', [])
-        valid_messages = [m for m in messages if isinstance(m, dict)]
+        valid_messages = [m for m in account['messages'] if isinstance(m, dict)]
         
         if not valid_messages:
             await send_bot_message(
@@ -645,10 +655,15 @@ async def background_check():
                 try:
                     account = user_accounts_cache.get(user_id) or await get_user(user_id)
                     if account:
+                        # Нормализуем messages в список
+                        if 'messages' not in account or not isinstance(account['messages'], list):
+                            account['messages'] = []
+                        
                         new = await check_mailcat(account)
                         if new:
-                            account.setdefault('messages', []).extend(new)
+                            account['messages'].extend(new)
                             await save_user(user_id, account)
+                            
                             msg = new[0]
                             text = f"📨 **Новое письмо!**\n\n"
                             text += f"От: {msg['sender'][:35]}\n"
