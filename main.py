@@ -150,6 +150,14 @@ def extract_code(text):
                 return code
     return None
 
+def escape_markdown(text):
+    if not text:
+        return ''
+    chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in chars:
+        text = text.replace(char, f'\\{char}')
+    return text
+
 # ===== БАЗА ДАННЫХ =====
 def extract_value(data):
     if isinstance(data, dict) and 'value' in data:
@@ -157,7 +165,6 @@ def extract_value(data):
     return data
 
 def ensure_list(data):
-    """Приводит данные к списку"""
     if data is None:
         return []
     if isinstance(data, list):
@@ -178,9 +185,6 @@ def serialize_messages(messages):
     if not messages:
         return '[]'
     return json.dumps(messages, ensure_ascii=False)
-
-def deserialize_messages(data):
-    return ensure_list(data)
 
 async def init_db():
     sql = '''
@@ -320,7 +324,6 @@ async def create_mailcat_mailbox():
             }
 
 async def check_mailcat(account):
-    # Принудительно приводим к списку
     if 'messages' not in account or not isinstance(account['messages'], list):
         account['messages'] = []
     if 'read_ids' not in account or not isinstance(account['read_ids'], list):
@@ -420,6 +423,10 @@ async def send_bot_message(user_id, text, reply_markup=None):
         except:
             pass
         bot_messages.pop(user_id, None)
+    
+    # Экранируем текст для Markdown
+    text = escape_markdown(text)
+    
     try:
         sent = await bot.send_message(
             user_id,
@@ -430,8 +437,18 @@ async def send_bot_message(user_id, text, reply_markup=None):
         bot_messages[user_id] = sent.message_id
         return sent
     except Exception as e:
-        logger.error(f"Send error: {e}")
-        return None
+        # Если Markdown не сработал — отправляем без него
+        try:
+            sent = await bot.send_message(
+                user_id,
+                text,
+                reply_markup=reply_markup
+            )
+            bot_messages[user_id] = sent.message_id
+            return sent
+        except Exception as e2:
+            logger.error(f"Send error: {e2}")
+            return None
 
 async def show_main_screen(user_id):
     user_id = str(user_id)
@@ -443,7 +460,7 @@ async def show_main_screen(user_id):
     if not account:
         await send_bot_message(
             user_id,
-            "📧 **Временная почта**\n\nСоздайте email для регистрации",
+            "📧 Временная почта\n\nСоздайте email для регистрации",
             main_keyboard_no_account()
         )
         return
@@ -451,7 +468,7 @@ async def show_main_screen(user_id):
         account['messages'] = []
     valid_messages = [m for m in account['messages'] if isinstance(m, dict)]
     msg_count = len(valid_messages)
-    text = f"📧 **Ваш ящик:** `{account['email']}`\n\n📨 Писем: **{msg_count}**"
+    text = f"📧 Ваш ящик: {account['email']}\n\n📨 Писем: {msg_count}"
     await send_bot_message(user_id, text, main_keyboard_with_account())
 
 @dp.message_handler(commands=['start'])
@@ -464,7 +481,7 @@ async def start(message: types.Message):
     else:
         await send_bot_message(
             user_id,
-            "👋 **Добро пожаловать!**\n\n📧 Временная почта\nСоздайте email для регистрации",
+            "👋 Добро пожаловать!\n\n📧 Временная почта\nСоздайте email для регистрации",
             main_keyboard_no_account()
         )
 
@@ -487,7 +504,7 @@ async def create_handler(message: types.Message):
         logger.error(f"Create error: {e}")
         await send_bot_message(
             user_id,
-            f"❌ **Ошибка создания**\n\n{str(e)[:200]}",
+            f"❌ Ошибка создания\n\n{str(e)[:200]}",
             main_keyboard_no_account()
         )
 
@@ -506,7 +523,7 @@ async def check_handler(message: types.Message):
         account['messages'] = []
     if not isinstance(account.get('read_ids'), list):
         account['read_ids'] = []
-    await send_bot_message(user_id, "🔄 **Проверяю...**", None)
+    await send_bot_message(user_id, "🔄 Проверяю...", None)
     try:
         new = await check_mailcat(account)
         if new:
@@ -516,23 +533,23 @@ async def check_handler(message: types.Message):
         if not valid_messages:
             await send_bot_message(
                 user_id,
-                "📭 **Писем нет**",
+                "📭 Писем нет",
                 back_keyboard()
             )
             return
-        text = f"📩 **Письма ({len(valid_messages)}):**\n\n"
+        text = f"📩 Письма ({len(valid_messages)}):\n\n"
         for i, msg in enumerate(valid_messages[-10:][::-1], 1):
-            time = datetime.fromisoformat(msg['received_at']).strftime('%H:%M')
-            text += f"{i}. [{time}] **{msg.get('subject', '(no subject)')[:35]}**\n"
+            time = datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M')
+            text += f"{i}. [{time}] {msg.get('subject', '(no subject)')[:35]}\n"
             text += f"   От: {msg.get('sender', 'unknown')[:30]}\n"
             if msg.get('code'):
-                text += f"   🔑 Код: `{msg['code']}`\n"
+                text += f"   🔑 Код: {msg['code']}\n"
             if msg.get('links') and msg['links'][0]:
                 text += f"   🔗 {msg['links'][0]}\n"
             text += "\n"
         if len(valid_messages) > 10:
             text += f"... и еще {len(valid_messages)-10}\n"
-        text += f"\n📌 **Всего:** {len(valid_messages)}"
+        text += f"\n📌 Всего: {len(valid_messages)}"
         await send_bot_message(
             user_id,
             text,
@@ -542,7 +559,7 @@ async def check_handler(message: types.Message):
         logger.error(f"Check error: {e}")
         await send_bot_message(
             user_id,
-            f"❌ **Ошибка**\n\n{str(e)[:200]}",
+            f"❌ Ошибка\n\n{str(e)[:200]}",
             back_keyboard()
         )
 
@@ -568,7 +585,7 @@ async def delete_handler(message: types.Message):
         return
     await send_bot_message(
         user_id,
-        f"⚠️ **Удалить ящик?**\n\n`{account['email']}`\n\nВсе письма удалятся.",
+        f"⚠️ Удалить ящик?\n\n{account['email']}\n\nВсе письма удалятся.",
         confirm_delete_keyboard()
     )
 
@@ -593,7 +610,7 @@ async def confirm_delete_handler(message: types.Message):
     await delete_user(user_id)
     await send_bot_message(
         user_id,
-        "🗑 **Ящик удалён**",
+        "🗑 Ящик удалён",
         main_keyboard_no_account()
     )
 
@@ -634,12 +651,12 @@ async def background_check():
                             account['messages'].extend(new)
                             await save_user(user_id, account)
                             msg = new[0]
-                            text = f"📨 **Новое письмо!**\n\nОт: {msg['sender'][:35]}\nТема: {msg['subject'][:40]}"
+                            text = f"📨 Новое письмо!\n\nОт: {msg['sender'][:35]}\nТема: {msg['subject'][:40]}"
                             if msg.get('code'):
-                                text += f"\n🔑 Код: `{msg['code']}`"
+                                text += f"\n🔑 Код: {msg['code']}"
                             if msg.get('links') and msg['links'][0]:
                                 text += f"\n🔗 {msg['links'][0]}"
-                            await bot.send_message(int(user_id), text, parse_mode='Markdown')
+                            await bot.send_message(int(user_id), text)
                 except Exception as e:
                     logger.error(f"Background error for {user_id}: {e}")
         except Exception as e:
