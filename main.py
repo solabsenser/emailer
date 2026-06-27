@@ -3,7 +3,7 @@ import logging
 import secrets
 import string
 import aiohttp
-import hashlib
+import base64
 from datetime import datetime
 from collections import defaultdict
 from aiohttp import web
@@ -20,25 +20,19 @@ logger = logging.getLogger(__name__)
 # ===== КОНФИГ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "https://your-service.onrender.com")
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "https://emailer-lxu5.onrender.com")
 
 # ===== ХРАНИЛИЩЕ =====
-user_accounts = {}  # {user_id: {email, sid, messages: []}}
+user_accounts = {}
 user_messages = {}
-last_check = {}
 
 # ===== GUERRILLA MAIL API =====
-# Документация: https://www.guerrillamail.com/apidocs
 GM_API = "https://api.guerrillamail.com/ajax.php"
 
 async def create_guerrilla_email():
-    """Создает email через Guerrilla Mail"""
     async with aiohttp.ClientSession() as session:
-        # Генерируем email
         local = ''.join(secrets.choice(string.ascii_lowercase) for _ in range(8))
-        email = f"{local}@guerrillamail.com"
         
-        # Получаем sid
         params = {
             'f': 'get_email_address',
             'ip': '127.0.0.1',
@@ -65,7 +59,6 @@ async def create_guerrilla_email():
             }
 
 async def check_guerrilla_mail(account):
-    """Проверяет новые письма через Guerrilla Mail"""
     async with aiohttp.ClientSession() as session:
         params = {
             'f': 'fetch_email',
@@ -86,7 +79,6 @@ async def check_guerrilla_mail(account):
                 if mail_id not in account.get('ids', []):
                     account.setdefault('ids', []).append(mail_id)
                     
-                    # Получаем полное письмо
                     params2 = {
                         'f': 'fetch_email',
                         'sid': account['sid'],
@@ -97,8 +89,6 @@ async def check_guerrilla_mail(account):
                         if resp2.status == 200:
                             full = await resp2.json()
                             
-                            # Декодируем body (base64)
-                            import base64
                             body_raw = full.get('mail_body', '')
                             try:
                                 body = base64.b64decode(body_raw).decode('utf-8', errors='ignore')
@@ -116,17 +106,24 @@ async def check_guerrilla_mail(account):
 
 # ===== WEB СЕРВЕР =====
 async def webhook(request):
-    if request.headers.get('content-type') == 'application/json':
-        data = await request.json()
-        try:
-            await dp.process_update(data)
-        except Exception as e:
-            logger.error(f"Webhook error: {e}")
-        return web.Response(text="OK")
+    """Обработка webhook от Telegram"""
+    try:
+        if request.headers.get('content-type') == 'application/json':
+            data = await request.json()
+            
+            # Создаем объект Update из данных
+            update = types.Update(**data)
+            
+            # Обрабатываем через диспетчер
+            await dp.process_update(update)
+            return web.Response(text="OK", status=200)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+    
     return web.Response(text="Bad Request", status=400)
 
 async def health_check(request):
-    return web.Response(text="OK")
+    return web.Response(text="OK", status=200)
 
 async def start_web():
     app = web.Application()
@@ -211,14 +208,12 @@ async def handle_callbacks(callback: types.CallbackQuery):
         try:
             account = await create_guerrilla_email()
             user_accounts[str(user_id)] = account
-            last_check[str(user_id)] = datetime.now()
             
             await safe_edit(
                 user_id,
                 f"✅ **Создан email:**\n`{account['email']}`\n\n"
                 f"📩 Используйте этот адрес для регистрации\n"
-                f"🔄 Нажмите «Проверить почту»\n"
-                f"⏳ Письма приходят с задержкой до 30 сек",
+                f"🔄 Нажмите «Проверить почту»",
                 get_main_menu()
             )
         except Exception as e:
@@ -252,7 +247,7 @@ async def handle_callbacks(callback: types.CallbackQuery):
                 account.setdefault('messages', []).extend(new_messages)
                 await safe_edit(
                     user_id,
-                    f"✅ **Получено {len(new_messages)} писем!**\n\nНажмите ещё раз для просмотра",
+                    f"✅ **Получено {len(new_messages)} писем!**",
                     get_main_menu()
                 )
             else:
@@ -264,7 +259,7 @@ async def handle_callbacks(callback: types.CallbackQuery):
                 )
         except Exception as e:
             logger.error(f"Check error: {e}")
-            await safe_edit(user_id, "❌ **Ошибка проверки**\nПопробуйте позже", get_main_menu())
+            await safe_edit(user_id, "❌ **Ошибка проверки**", get_main_menu())
     
     elif data.startswith("view_"):
         account = user_accounts.get(str(user_id))
@@ -325,8 +320,7 @@ async def background_check():
                             int(user_id),
                             f"📨 **Новое письмо!**\n\n"
                             f"От: {new_messages[0]['sender']}\n"
-                            f"Тема: {new_messages[0]['subject']}\n\n"
-                            f"Нажмите «Проверить почту»",
+                            f"Тема: {new_messages[0]['subject']}",
                             parse_mode='Markdown'
                         )
                 except:
