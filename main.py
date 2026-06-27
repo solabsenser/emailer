@@ -4,6 +4,7 @@ import secrets
 import string
 import aiohttp
 import re
+import email.header
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -23,11 +24,31 @@ PORT = int(os.getenv("PORT", 10000))
 user_accounts = {}
 user_messages = {}
 
+def decode_header_value(value):
+    """Декодирует заголовки письма (типа =?UTF-8?Q?...)"""
+    if not value:
+        return ''
+    
+    try:
+        decoded_parts = []
+        for part, encoding in email.header.decode_header(value):
+            if isinstance(part, bytes):
+                try:
+                    if encoding:
+                        part = part.decode(encoding, errors='ignore')
+                    else:
+                        part = part.decode('utf-8', errors='ignore')
+                except:
+                    part = part.decode('utf-8', errors='ignore')
+            decoded_parts.append(str(part))
+        return ' '.join(decoded_parts)
+    except:
+        return value
+
 # ===== MAILCAT API =====
 MAILCAT_API = "https://api.mailcat.ai"
 
 async def create_mailcat_mailbox():
-    """Создает временный email через MailCat"""
     async with aiohttp.ClientSession() as session:
         async with session.post(f"{MAILCAT_API}/mailboxes") as resp:
             if resp.status not in [200, 201]:
@@ -51,7 +72,6 @@ async def create_mailcat_mailbox():
             }
 
 async def check_mailcat(account):
-    """Проверяет новые письма через MailCat"""
     async with aiohttp.ClientSession() as session:
         headers = {"Authorization": f"Bearer {account['token']}"}
         
@@ -73,14 +93,21 @@ async def check_mailcat(account):
                         email_data = full.get('data', {})
                         
                         code = email_data.get('code', '')
+                        
+                        raw_subject = email_data.get('email', {}).get('subject', '(no subject)')
+                        subject = decode_header_value(raw_subject)
+                        
+                        raw_from = email_data.get('email', {}).get('from', 'unknown')
+                        sender = decode_header_value(raw_from)
+                        
                         body = email_data.get('email', {}).get('text', '')
                         if not body:
                             body = email_data.get('email', {}).get('html', '')
                             body = re.sub(r'<[^>]+>', '', body)
                         
                         new_messages.append({
-                            'sender': email_data.get('email', {}).get('from', 'unknown'),
-                            'subject': email_data.get('email', {}).get('subject', '(no subject)'),
+                            'sender': sender,
+                            'subject': subject,
                             'body': body[:5000],
                             'code': code,
                             'received_at': datetime.now()
@@ -147,7 +174,7 @@ async def create_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     if str(user_id) in user_accounts:
-        await update_or_send(user_id, "❌ **У вас уже есть ящик**\n\nУдалите старый", get_main_menu())
+        await update_or_send(user_id, "❌ **У вас уже есть ящик**", get_main_menu())
         return
     
     try:
@@ -156,8 +183,7 @@ async def create_callback(callback: types.CallbackQuery):
         await update_or_send(
             user_id,
             f"✅ **Создан email:**\n`{account['email']}`\n\n"
-            f"📩 Используйте для регистрации\n"
-            f"🔑 MailCat сам найдет код подтверждения!",
+            f"📩 Используйте для регистрации",
             get_main_menu()
         )
     except Exception as e:
@@ -190,16 +216,17 @@ async def check_callback(callback: types.CallbackQuery):
             account.setdefault('messages', []).extend(new)
             codes = [msg.get('code', '') for msg in new if msg.get('code')]
             if codes:
+                code_text = "\n".join([f"• `{c}`" for c in codes[:5]])
                 await update_or_send(
                     user_id,
-                    f"✅ **{len(new)} новых писем!**\n\n"
-                    f"🔑 **Коды подтверждения:**\n" + "\n".join([f"• `{c}`" for c in codes[:5]]),
+                    f"✅ **{len(new)} новых писем!**\n\n🔑 **Коды:**\n{code_text}",
                     get_main_menu()
                 )
             else:
                 await update_or_send(user_id, f"✅ **{len(new)} новых писем!**", get_main_menu())
         else:
-            await update_or_send(user_id, f"📭 **Новых писем нет**\nВсего: {len(account.get('messages', []))}", get_main_menu())
+            total = len(account.get('messages', []))
+            await update_or_send(user_id, f"📭 **Новых писем нет**\nВсего: {total}", get_main_menu())
     except Exception as e:
         await update_or_send(user_id, f"❌ **Ошибка:** {str(e)[:200]}", get_main_menu())
 
@@ -219,8 +246,8 @@ async def view_callback(callback: types.CallbackQuery):
     
     text = f"📩 **Письма:**\n\n"
     for i, msg in enumerate(messages[-10:][::-1], 1):
-        text += f"{i}. **{msg['subject'][:35]}**\n"
-        text += f"   От: {msg['sender'][:30]}\n"
+        text += f"{i}. **{msg['subject'][:40]}**\n"
+        text += f"   От: {msg['sender'][:35]}\n"
         if msg.get('code'):
             text += f"   🔑 Код: `{msg['code']}`\n"
         text += "\n"
@@ -261,7 +288,7 @@ async def background_check():
                     if new:
                         account.setdefault('messages', []).extend(new)
                         codes = [msg.get('code', '') for msg in new if msg.get('code')]
-                        msg_text = f"📨 **Новое письмо!**\nОт: {new[0]['sender']}\nТема: {new[0]['subject']}"
+                        msg_text = f"📨 **Новое письмо!**\nОт: {new[0]['sender'][:35]}\nТема: {new[0]['subject'][:40]}"
                         if codes:
                             msg_text += f"\n🔑 Код: `{codes[0]}`"
                         await bot.send_message(int(user_id), msg_text, parse_mode='Markdown')
