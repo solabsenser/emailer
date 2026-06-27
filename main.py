@@ -6,7 +6,6 @@ import aiohttp
 import re
 import email.header
 import json
-import quopri
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -101,28 +100,6 @@ def decode_header_value(value):
     except:
         return value
 
-def decode_quoted_printable(text):
-    """Правильно декодирует quoted-printable с русскими буквами"""
-    if not text:
-        return ''
-    try:
-        # Убираем экранирование
-        text = text.replace('\\-', '-').replace('\\.', '.').replace('\\=', '=')
-        # Декодируем quoted-printable
-        decoded = quopri.decodestring(text.encode('utf-8'))
-        # Пробуем UTF-8
-        try:
-            return decoded.decode('utf-8', errors='ignore')
-        except:
-            # Пробуем Windows-1251
-            try:
-                return decoded.decode('windows-1251', errors='ignore')
-            except:
-                return decoded.decode('utf-8', errors='ignore')
-    except Exception as e:
-        logger.error(f"Decode error: {e}")
-        return text
-
 def extract_links_from_text(text):
     if not text:
         return []
@@ -155,13 +132,23 @@ def find_confirmation_link(links):
             return link
     return links[0] if links else None
 
-def escape_markdown(text):
+def extract_code(text):
     if not text:
-        return ''
-    chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    for char in chars:
-        text = text.replace(char, f'\\{char}')
-    return text
+        return None
+    patterns = [
+        r'\b(\d{4,8})\b',
+        r'код[:\s]*([A-Z0-9]{4,8})',
+        r'code[:\s]*([A-Z0-9]{4,8})',
+        r'verification code[:\s]*([A-Z0-9]{4,8})',
+        r'подтверждения[:\s]*([A-Z0-9]{4,8})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            code = match.group(1) if match.groups() else match.group(0)
+            if len(code) >= 4:
+                return code
+    return None
 
 # ===== БАЗА ДАННЫХ =====
 def extract_value(data):
@@ -358,26 +345,20 @@ async def check_mailcat(account):
                         raw_from = email_data.get('email', {}).get('from', 'unknown')
                         sender = decode_header_value(raw_from)
                         
-                        # Пробуем текстовую версию
                         clean_text = email_data.get('email', {}).get('text', '')
-                        # Если нет — чистим HTML
                         if not clean_text:
                             html = email_data.get('email', {}).get('html', '')
                             clean_text = clean_html_fallback(html)
                         
-                        # Декодируем quoted-printable
-                        clean_text = decode_quoted_printable(clean_text)
-                        
-                        # Извлекаем ссылки
                         all_links = extract_links_from_text(clean_text)
                         confirm_link = find_confirmation_link(all_links)
+                        code = extract_code(clean_text)
                         
                         new_messages.append({
                             'sender': sender,
                             'subject': subject,
-                            'body': clean_text[:500],
-                            'code': None,
                             'links': [confirm_link] if confirm_link else [],
+                            'code': code,
                             'received_at': datetime.now().isoformat()
                         })
         return new_messages
@@ -413,19 +394,6 @@ def main_keyboard_with_account():
     )
     return keyboard
 
-def back_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    keyboard.add(KeyboardButton("🔙 Назад"))
-    return keyboard
-
-def confirm_delete_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(
-        KeyboardButton("✅ Да, удалить"),
-        KeyboardButton("❌ Отмена")
-    )
-    return keyboard
-
 async def send_bot_message(user_id, text, reply_markup=None):
     user_id = str(user_id)
     old_msg_id = bot_messages.get(user_id)
@@ -458,9 +426,7 @@ async def show_main_screen(user_id):
     if not account:
         await send_bot_message(
             user_id,
-            "📧 **Временная почта**\n\n"
-            "Создайте временный email для регистрации\n"
-            "Письма приходят автоматически",
+            "📧 **Временная почта**\n\nСоздайте email для регистрации",
             main_keyboard_no_account()
         )
         return
@@ -468,13 +434,8 @@ async def show_main_screen(user_id):
         account['messages'] = []
     valid_messages = [m for m in account['messages'] if isinstance(m, dict)]
     msg_count = len(valid_messages)
-    text = f"📧 **Ваш ящик:**\n`{account['email']}`\n\n"
-    text += f"📨 Писем: **{msg_count}**\n"
-    await send_bot_message(
-        user_id,
-        text,
-        main_keyboard_with_account()
-    )
+    text = f"📧 **Ваш ящик:** `{account['email']}`\n\n📨 Писем: **{msg_count}**"
+    await send_bot_message(user_id, text, main_keyboard_with_account())
 
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
@@ -486,9 +447,7 @@ async def start(message: types.Message):
     else:
         await send_bot_message(
             user_id,
-            "👋 **Добро пожаловать!**\n\n"
-            "📧 Временная почта\n"
-            "Создайте email для регистрации",
+            "👋 **Добро пожаловать!**\n\n📧 Временная почта\nСоздайте email для регистрации",
             main_keyboard_no_account()
         )
 
@@ -515,57 +474,6 @@ async def create_handler(message: types.Message):
             main_keyboard_no_account()
         )
 
-@dp.callback_query_handler(lambda c: c.data.startswith("show_body_"))
-async def show_body_callback(callback: types.CallbackQuery):
-    user_id = str(callback.from_user.id)
-    parts = callback.data.split('_')
-    if len(parts) < 3:
-        await callback.answer("❌ Ошибка", show_alert=True)
-        return
-    try:
-        idx = int(parts[2])
-    except:
-        await callback.answer("❌ Ошибка", show_alert=True)
-        return
-    account = user_accounts_cache.get(user_id) or await get_user(user_id)
-    if not account:
-        await callback.answer("❌ Аккаунт не найден", show_alert=True)
-        return
-    valid_messages = [m for m in account.get('messages', []) if isinstance(m, dict)]
-    if idx < 1 or idx > len(valid_messages):
-        await callback.answer("❌ Письмо не найдено", show_alert=True)
-        return
-    msg = valid_messages[-idx]
-    body = msg.get('body', 'Нет текста')
-    body = decode_quoted_printable(body)  # Декодируем перед показом
-    body = escape_markdown(body)
-    text = f"📄 **Полный текст письма**\n\n"
-    text += f"📌 **От:** {msg.get('sender', 'unknown')}\n"
-    text += f"📌 **Тема:** {msg.get('subject', '(no subject)')}\n"
-    text += f"📌 **Время:** {datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M %d.%m.%Y')}\n\n"
-    text += f"📝 **Текст:**\n{body[:1000]}"
-    if len(body) > 1000:
-        text += f"\n\n... (текст обрезан, всего символов: {len(body)})"
-    if msg.get('links') and msg['links'][0]:
-        text += f"\n\n🔗 **Ссылка для подтверждения:**\n{msg['links'][0]}"
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(InlineKeyboardButton("🔙 Назад к письмам", callback_data="back_to_messages"))
-    try:
-        await callback.message.edit_text(text, parse_mode='Markdown', reply_markup=keyboard)
-    except Exception as e:
-        if "Can't parse entities" in str(e):
-            await callback.message.edit_text(text, reply_markup=keyboard)
-        else:
-            logger.error(f"Show body error: {e}")
-            await callback.answer("❌ Ошибка отображения", show_alert=True)
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "back_to_messages")
-async def back_to_messages_callback(callback: types.CallbackQuery):
-    user_id = str(callback.from_user.id)
-    await callback.answer()
-    await check_handler(callback.message)
-
 @dp.message_handler(lambda message: message.text == "📨 Проверить почту")
 async def check_handler(message: types.Message):
     user_id = str(message.from_user.id)
@@ -579,7 +487,7 @@ async def check_handler(message: types.Message):
         return
     if not isinstance(account.get('messages'), list):
         account['messages'] = []
-    await send_bot_message(user_id, "🔄 **Проверяю почту...**", None)
+    await send_bot_message(user_id, "🔄 **Проверяю...**", None)
     try:
         new = await check_mailcat(account)
         if new:
@@ -589,35 +497,30 @@ async def check_handler(message: types.Message):
         if not valid_messages:
             await send_bot_message(
                 user_id,
-                "📭 **Писем нет**\n\nНажмите «Назад»",
-                back_keyboard()
+                "📭 **Писем нет**",
+                main_keyboard_with_account()
             )
             return
         text = f"📩 **Письма ({len(valid_messages)}):**\n\n"
         for i, msg in enumerate(valid_messages[-10:][::-1], 1):
-            time = datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M')
+            time = datetime.fromisoformat(msg['received_at']).strftime('%H:%M')
             text += f"{i}. [{time}] **{msg.get('subject', '(no subject)')[:35]}**\n"
             text += f"   От: {msg.get('sender', 'unknown')[:30]}\n"
+            if msg.get('code'):
+                text += f"   🔑 Код: `{msg['code']}`\n"
             if msg.get('links') and msg['links'][0]:
                 text += f"   🔗 {msg['links'][0]}\n"
             text += "\n"
         if len(valid_messages) > 10:
-            text += f"... и еще {len(valid_messages)-10} писем\n"
+            text += f"... и еще {len(valid_messages)-10}\n"
         text += f"\n📌 **Всего:** {len(valid_messages)}"
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        for idx in range(1, min(len(valid_messages), 10) + 1):
-            keyboard.insert(InlineKeyboardButton(
-                f"📄 Письмо {idx}",
-                callback_data=f"show_body_{idx}"
-            ))
-        keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_main"))
-        await send_bot_message(user_id, text, keyboard)
+        await send_bot_message(user_id, text, main_keyboard_with_account())
     except Exception as e:
         logger.error(f"Check error: {e}")
         await send_bot_message(
             user_id,
-            f"❌ **Ошибка проверки**\n\n{str(e)[:200]}",
-            back_keyboard()
+            f"❌ **Ошибка**\n\n{str(e)[:200]}",
+            main_keyboard_with_account()
         )
 
 @dp.message_handler(lambda message: message.text == "🗑 Удалить ящик")
@@ -633,13 +536,19 @@ async def delete_handler(message: types.Message):
         return
     await send_bot_message(
         user_id,
-        f"⚠️ **Вы уверены, что хотите удалить ящик?**\n\n"
-        f"📧 `{account['email']}`\n\n"
-        f"Все письма будут удалены безвозвратно.",
+        f"⚠️ **Удалить ящик?**\n\n`{account['email']}`\n\nВсе письма удалятся.",
         confirm_delete_keyboard()
     )
 
-@dp.message_handler(lambda message: message.text == "✅ Да, удалить")
+def confirm_delete_keyboard():
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(
+        KeyboardButton("✅ Да"),
+        KeyboardButton("❌ Нет")
+    )
+    return keyboard
+
+@dp.message_handler(lambda message: message.text == "✅ Да")
 async def confirm_delete_handler(message: types.Message):
     user_id = str(message.from_user.id)
     try:
@@ -660,21 +569,12 @@ async def confirm_delete_handler(message: types.Message):
     await delete_user(user_id)
     await send_bot_message(
         user_id,
-        "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости",
+        "🗑 **Ящик удалён**",
         main_keyboard_no_account()
     )
 
-@dp.message_handler(lambda message: message.text == "❌ Отмена")
+@dp.message_handler(lambda message: message.text == "❌ Нет")
 async def cancel_delete_handler(message: types.Message):
-    user_id = str(message.from_user.id)
-    try:
-        await bot.delete_message(user_id, message.message_id)
-    except:
-        pass
-    await show_main_screen(user_id)
-
-@dp.message_handler(lambda message: message.text == "🔙 Назад")
-async def back_handler(message: types.Message):
     user_id = str(message.from_user.id)
     try:
         await bot.delete_message(user_id, message.message_id)
@@ -702,26 +602,23 @@ async def background_check():
                     account = user_accounts_cache.get(user_id) or await get_user(user_id)
                     if account:
                         if not isinstance(account.get('messages'), list):
-                            logger.warning(f"⚠️ messages is {type(account.get('messages'))}, fixing for user {user_id}")
                             account['messages'] = []
                             await save_user(user_id, account)
-                            logger.info(f"✅ Fixed messages for user {user_id}")
                         new = await check_mailcat(account)
                         if new:
                             account['messages'].extend(new)
                             await save_user(user_id, account)
                             msg = new[0]
-                            text = f"📨 **Новое письмо!**\n\n"
-                            text += f"От: {msg['sender'][:35]}\n"
-                            text += f"Тема: {msg['subject'][:40]}\n"
+                            text = f"📨 **Новое письмо!**\n\nОт: {msg['sender'][:35]}\nТема: {msg['subject'][:40]}"
+                            if msg.get('code'):
+                                text += f"\n🔑 Код: `{msg['code']}`"
                             if msg.get('links') and msg['links'][0]:
-                                text += f"🔗 {msg['links'][0]}\n"
-                            text += f"\n📌 Нажмите «Проверить почту» для просмотра"
+                                text += f"\n🔗 {msg['links'][0]}"
                             await bot.send_message(int(user_id), text, parse_mode='Markdown')
                 except Exception as e:
-                    logger.error(f"Background check error for {user_id}: {e}")
+                    logger.error(f"Background error: {e}")
         except Exception as e:
-            logger.error(f"Background check error: {e}")
+            logger.error(f"Background error: {e}")
         await asyncio.sleep(30)
 
 async def main():
@@ -731,7 +628,6 @@ async def main():
         await load_all_users_to_cache()
         await start_web()
         asyncio.create_task(background_check())
-        
         for attempt in range(5):
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
@@ -740,7 +636,6 @@ async def main():
             except Exception as e:
                 logger.warning(f"Webhook delete attempt {attempt+1} failed: {e}")
                 await asyncio.sleep(2)
-        
         logger.info("🚀 Bot started")
         while True:
             try:
@@ -748,7 +643,7 @@ async def main():
                 break
             except Exception as e:
                 if "ConflictError" in str(e) or "TerminatedByOtherGetUpdates" in str(e):
-                    logger.warning("⚠️ Conflict detected, waiting 10 seconds...")
+                    logger.warning("⚠️ Conflict, waiting 10 seconds...")
                     await asyncio.sleep(10)
                 else:
                     logger.error(f"Polling error: {e}")
