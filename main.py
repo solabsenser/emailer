@@ -28,7 +28,6 @@ def decode_header_value(value):
     """Декодирует заголовки письма (типа =?UTF-8?Q?...)"""
     if not value:
         return ''
-    
     try:
         decoded_parts = []
         for part, encoding in email.header.decode_header(value):
@@ -44,6 +43,40 @@ def decode_header_value(value):
         return ' '.join(decoded_parts)
     except:
         return value
+
+def extract_links(text):
+    """Находит все URL-ссылки в тексте"""
+    if not text:
+        return []
+    url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+    links = re.findall(url_pattern, text)
+    clean_links = []
+    for link in links:
+        link = link.strip('.,;:!?()[]{}"\'' )
+        if link.startswith('http') or link.startswith('www'):
+            clean_links.append(link)
+    return clean_links
+
+def extract_code(text):
+    """Пытается найти код подтверждения в тексте"""
+    if not text:
+        return None
+    
+    # Паттерны для кодов: 6 цифр, 4-8 букв/цифр, и т.д.
+    patterns = [
+        r'\b\d{4,8}\b',          # 4-8 цифр
+        r'\b[A-Z0-9]{4,8}\b',     # 4-8 символов (заглавные + цифры)
+        r'код[:\s]*([A-Z0-9]{4,8})',  # "код: 123456"
+        r'verification code[:\s]*([A-Z0-9]{4,8})',  # "verification code: 123456"
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            code = match.group(1) if match.groups() else match.group(0)
+            if len(code) >= 4:
+                return code
+    return None
 
 # ===== MAILCAT API =====
 MAILCAT_API = "https://api.mailcat.ai"
@@ -92,24 +125,29 @@ async def check_mailcat(account):
                         full = await resp2.json()
                         email_data = full.get('data', {})
                         
-                        code = email_data.get('code', '')
-                        
+                        # Декодируем тему и отправителя
                         raw_subject = email_data.get('email', {}).get('subject', '(no subject)')
                         subject = decode_header_value(raw_subject)
                         
                         raw_from = email_data.get('email', {}).get('from', 'unknown')
                         sender = decode_header_value(raw_from)
                         
+                        # Получаем тело письма
                         body = email_data.get('email', {}).get('text', '')
                         if not body:
                             body = email_data.get('email', {}).get('html', '')
                             body = re.sub(r'<[^>]+>', '', body)
+                        
+                        # Извлекаем код и ссылки
+                        code = extract_code(body) or email_data.get('code', '')
+                        links = extract_links(body)
                         
                         new_messages.append({
                             'sender': sender,
                             'subject': subject,
                             'body': body[:5000],
                             'code': code,
+                            'links': links[:5],  # максимум 5 ссылок
                             'received_at': datetime.now()
                         })
         
@@ -163,8 +201,7 @@ async def start(message: types.Message):
         "📧 **Временная почта**\n\n"
         "Создавайте email и получайте письма\n"
         "🌐 Используется MailCat\n\n"
-        "⏳ Письма приходят с задержкой до 30 сек\n"
-        "🔑 MailCat сам извлекает коды подтверждения!",
+        "🔑 Бот находит коды и ссылки из писем!",
         get_main_menu()
     )
 
@@ -214,16 +251,25 @@ async def check_callback(callback: types.CallbackQuery):
         new = await check_mailcat(account)
         if new:
             account.setdefault('messages', []).extend(new)
-            codes = [msg.get('code', '') for msg in new if msg.get('code')]
+            
+            # Формируем сообщение с кодами и ссылками
+            codes = [msg.get('code') for msg in new if msg.get('code')]
+            links = []
+            for msg in new:
+                links.extend(msg.get('links', []))
+            
+            response = f"✅ **{len(new)} новых писем!**\n"
+            
             if codes:
-                code_text = "\n".join([f"• `{c}`" for c in codes[:5]])
-                await update_or_send(
-                    user_id,
-                    f"✅ **{len(new)} новых писем!**\n\n🔑 **Коды:**\n{code_text}",
-                    get_main_menu()
-                )
-            else:
-                await update_or_send(user_id, f"✅ **{len(new)} новых писем!**", get_main_menu())
+                response += "\n🔑 **Коды:**\n" + "\n".join([f"• `{c}`" for c in codes[:5]])
+            
+            if links:
+                response += "\n\n🔗 **Ссылки:**\n" + "\n".join([f"• {link[:60]}..." if len(link) > 60 else f"• {link}" for link in links[:5]])
+            
+            if not codes and not links:
+                response += "\n\n📝 Нажмите «Мои ящики» для просмотра"
+            
+            await update_or_send(user_id, response, get_main_menu())
         else:
             total = len(account.get('messages', []))
             await update_or_send(user_id, f"📭 **Новых писем нет**\nВсего: {total}", get_main_menu())
@@ -250,6 +296,9 @@ async def view_callback(callback: types.CallbackQuery):
         text += f"   От: {msg['sender'][:35]}\n"
         if msg.get('code'):
             text += f"   🔑 Код: `{msg['code']}`\n"
+        if msg.get('links'):
+            for link in msg['links'][:2]:
+                text += f"   🔗 {link[:50]}...\n"
         text += "\n"
     
     text += f"\n📌 **Всего:** {len(messages)}"
@@ -287,10 +336,15 @@ async def background_check():
                     new = await check_mailcat(account)
                     if new:
                         account.setdefault('messages', []).extend(new)
-                        codes = [msg.get('code', '') for msg in new if msg.get('code')]
+                        
                         msg_text = f"📨 **Новое письмо!**\nОт: {new[0]['sender'][:35]}\nТема: {new[0]['subject'][:40]}"
-                        if codes:
-                            msg_text += f"\n🔑 Код: `{codes[0]}`"
+                        
+                        if new[0].get('code'):
+                            msg_text += f"\n🔑 Код: `{new[0]['code']}`"
+                        
+                        if new[0].get('links'):
+                            msg_text += f"\n🔗 {new[0]['links'][0][:60]}..."
+                        
                         await bot.send_message(int(user_id), msg_text, parse_mode='Markdown')
                 except:
                     pass
