@@ -23,7 +23,6 @@ PORT = int(os.getenv("PORT", 10000))
 # ===== ХРАНИЛИЩЕ =====
 user_accounts = {}
 bot_messages = {}  # {user_id: message_id} - ID последнего сообщения бота
-user_last_message = {}  # {user_id: message_id} - ID последнего сообщения пользователя
 
 def decode_header_value(value):
     if not value:
@@ -178,28 +177,16 @@ def confirm_delete_keyboard():
     )
     return keyboard
 
-async def clean_old_messages(user_id, user_msg_id=None):
-    """Удаляет старые сообщения бота и пользователя"""
-    # Удаляем старое сообщение бота
-    old_bot_msg = bot_messages.get(user_id)
-    if old_bot_msg:
+async def send_bot_message(user_id, text, reply_markup=None):
+    """Отправляет сообщение от бота, удаляя предыдущее сообщение бота"""
+    # Удаляем предыдущее сообщение бота
+    old_msg_id = bot_messages.get(user_id)
+    if old_msg_id:
         try:
-            await bot.delete_message(user_id, old_bot_msg)
+            await bot.delete_message(user_id, old_msg_id)
         except:
             pass
         bot_messages.pop(user_id, None)
-    
-    # Удаляем сообщение пользователя, если передано
-    if user_msg_id:
-        try:
-            await bot.delete_message(user_id, user_msg_id)
-        except:
-            pass
-
-async def send_bot_message(user_id, text, reply_markup=None, delete_user_msg_id=None):
-    """Отправляет сообщение от бота, очищая старые"""
-    # Чистим старые сообщения
-    await clean_old_messages(user_id, delete_user_msg_id)
     
     # Отправляем новое
     try:
@@ -215,7 +202,7 @@ async def send_bot_message(user_id, text, reply_markup=None, delete_user_msg_id=
         logger.error(f"Send error: {e}")
         return None
 
-async def show_main_screen(user_id, delete_user_msg_id=None):
+async def show_main_screen(user_id):
     account = user_accounts.get(str(user_id))
     
     if not account:
@@ -224,8 +211,7 @@ async def show_main_screen(user_id, delete_user_msg_id=None):
             "📧 **Временная почта**\n\n"
             "Создайте временный email для регистрации\n"
             "Письма приходят автоматически",
-            main_keyboard_no_account(),
-            delete_user_msg_id
+            main_keyboard_no_account()
         )
         return
     
@@ -241,49 +227,70 @@ async def show_main_screen(user_id, delete_user_msg_id=None):
     await send_bot_message(
         user_id,
         text,
-        main_keyboard_with_account(),
-        delete_user_msg_id
+        main_keyboard_with_account()
     )
 
-@dp.message_handler(commands=['start', 'menu'])
+# ===== /start ОСТАЁТСЯ В ЧАТЕ =====
+@dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     user_id = message.from_user.id
-    await show_main_screen(user_id, message.message_id)
+    # НЕ удаляем /start, просто показываем меню
+    await send_bot_message(
+        user_id,
+        "👋 **Добро пожаловать!**\n\n"
+        "📧 Временная почта\n"
+        "Создайте email для регистрации\n"
+        "Письма приходят автоматически",
+        main_keyboard_no_account() if str(user_id) not in user_accounts else main_keyboard_with_account()
+    )
+
+@dp.message_handler(commands=['menu'])
+async def menu(message: types.Message):
+    user_id = message.from_user.id
+    await show_main_screen(user_id)
 
 @dp.message_handler(lambda message: message.text == "📧 Создать почту")
 async def create_handler(message: types.Message):
     user_id = message.from_user.id
     
+    # Удаляем сообщение пользователя
+    try:
+        await bot.delete_message(user_id, message.message_id)
+    except:
+        pass
+    
     if str(user_id) in user_accounts:
-        await show_main_screen(user_id, message.message_id)
+        await show_main_screen(user_id)
         return
     
     try:
         account = await create_mailcat_mailbox()
         user_accounts[str(user_id)] = account
-        await show_main_screen(user_id, message.message_id)
+        await show_main_screen(user_id)
     except Exception as e:
         logger.error(f"Create error: {e}")
         await send_bot_message(
             user_id,
             f"❌ **Ошибка создания**\n\n{str(e)[:200]}",
-            main_keyboard_no_account(),
-            message.message_id
+            main_keyboard_no_account()
         )
 
 @dp.message_handler(lambda message: message.text == "📨 Проверить почту")
 async def check_handler(message: types.Message):
     user_id = message.from_user.id
     
+    # Удаляем сообщение пользователя
+    try:
+        await bot.delete_message(user_id, message.message_id)
+    except:
+        pass
+    
     account = user_accounts.get(str(user_id))
     if not account:
-        await show_main_screen(user_id, message.message_id)
+        await show_main_screen(user_id)
         return
     
-    # Временное сообщение "Проверяю..."
-    await clean_old_messages(user_id, message.message_id)
-    temp_msg = await bot.send_message(user_id, "🔄 **Проверяю почту...**", parse_mode='Markdown')
-    bot_messages[user_id] = temp_msg.message_id
+    await send_bot_message(user_id, "🔄 **Проверяю почту...**", None)
     
     try:
         new = await check_mailcat(account)
@@ -316,8 +323,6 @@ async def check_handler(message: types.Message):
         
         text += f"\n📌 **Всего:** {len(messages)}"
         
-        # Удаляем временное сообщение и отправляем результат
-        await clean_old_messages(user_id)
         await send_bot_message(user_id, text, back_keyboard())
         
     except Exception as e:
@@ -332,9 +337,15 @@ async def check_handler(message: types.Message):
 async def delete_handler(message: types.Message):
     user_id = message.from_user.id
     
+    # Удаляем сообщение пользователя
+    try:
+        await bot.delete_message(user_id, message.message_id)
+    except:
+        pass
+    
     account = user_accounts.get(str(user_id))
     if not account:
-        await show_main_screen(user_id, message.message_id)
+        await show_main_screen(user_id)
         return
     
     await send_bot_message(
@@ -342,17 +353,22 @@ async def delete_handler(message: types.Message):
         f"⚠️ **Вы уверены, что хотите удалить ящик?**\n\n"
         f"📧 `{account['email']}`\n\n"
         f"Все письма будут удалены безвозвратно.",
-        confirm_delete_keyboard(),
-        message.message_id
+        confirm_delete_keyboard()
     )
 
 @dp.message_handler(lambda message: message.text == "✅ Да, удалить")
 async def confirm_delete_handler(message: types.Message):
     user_id = message.from_user.id
     
+    # Удаляем сообщение пользователя
+    try:
+        await bot.delete_message(user_id, message.message_id)
+    except:
+        pass
+    
     account = user_accounts.get(str(user_id))
     if not account:
-        await show_main_screen(user_id, message.message_id)
+        await show_main_screen(user_id)
         return
     
     try:
@@ -367,24 +383,42 @@ async def confirm_delete_handler(message: types.Message):
     await send_bot_message(
         user_id,
         "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости",
-        main_keyboard_no_account(),
-        message.message_id
+        main_keyboard_no_account()
     )
 
 @dp.message_handler(lambda message: message.text == "❌ Отмена")
 async def cancel_delete_handler(message: types.Message):
     user_id = message.from_user.id
-    await show_main_screen(user_id, message.message_id)
+    
+    # Удаляем сообщение пользователя
+    try:
+        await bot.delete_message(user_id, message.message_id)
+    except:
+        pass
+    
+    await show_main_screen(user_id)
 
 @dp.message_handler(lambda message: message.text == "🔙 Назад")
 async def back_handler(message: types.Message):
     user_id = message.from_user.id
-    await show_main_screen(user_id, message.message_id)
+    
+    # Удаляем сообщение пользователя
+    try:
+        await bot.delete_message(user_id, message.message_id)
+    except:
+        pass
+    
+    await show_main_screen(user_id)
 
 @dp.message_handler()
 async def any_message(message: types.Message):
     user_id = message.from_user.id
-    await show_main_screen(user_id, message.message_id)
+    # Удаляем всё, что не обработано
+    try:
+        await bot.delete_message(user_id, message.message_id)
+    except:
+        pass
+    await show_main_screen(user_id)
 
 async def background_check():
     while True:
