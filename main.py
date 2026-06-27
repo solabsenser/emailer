@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 # ===== ХРАНИЛИЩЕ =====
 user_accounts = {}
-user_messages = {}  # {user_id: message_id}
+bot_messages = {}  # {user_id: message_id} - ID сообщений БОТА
 
 def decode_header_value(value):
     if not value:
@@ -177,16 +177,16 @@ def confirm_delete_keyboard():
     )
     return keyboard
 
-async def send_new_message(user_id, text, reply_markup=None):
-    """Отправляет новое сообщение, удаляя старое"""
-    # Удаляем старое сообщение
-    old_msg_id = user_messages.get(user_id)
+async def send_bot_message(user_id, text, reply_markup=None):
+    """Отправляет сообщение от бота, удаляя предыдущее сообщение бота"""
+    # Удаляем предыдущее сообщение бота
+    old_msg_id = bot_messages.get(user_id)
     if old_msg_id:
         try:
             await bot.delete_message(user_id, old_msg_id)
-        except:
-            pass
-        user_messages.pop(user_id, None)
+        except Exception as e:
+            logger.debug(f"Delete old message error: {e}")
+        bot_messages.pop(user_id, None)
     
     # Отправляем новое
     try:
@@ -196,7 +196,7 @@ async def send_new_message(user_id, text, reply_markup=None):
             parse_mode='Markdown',
             reply_markup=reply_markup
         )
-        user_messages[user_id] = sent.message_id
+        bot_messages[user_id] = sent.message_id
         return sent
     except Exception as e:
         logger.error(f"Send error: {e}")
@@ -206,7 +206,7 @@ async def show_main_screen(user_id):
     account = user_accounts.get(str(user_id))
     
     if not account:
-        await send_new_message(
+        await send_bot_message(
             user_id,
             "📧 **Временная почта**\n\n"
             "Создайте временный email для регистрации\n"
@@ -224,7 +224,7 @@ async def show_main_screen(user_id):
     if code_count:
         text += f"🔑 Кодов: **{code_count}**"
     
-    await send_new_message(
+    await send_bot_message(
         user_id,
         text,
         main_keyboard_with_account()
@@ -233,13 +233,11 @@ async def show_main_screen(user_id):
 @dp.message_handler(commands=['start', 'menu'])
 async def start(message: types.Message):
     user_id = message.from_user.id
-    user_messages[user_id] = message.message_id
     await show_main_screen(user_id)
 
 @dp.message_handler(lambda message: message.text == "📧 Создать почту")
 async def create_handler(message: types.Message):
     user_id = message.from_user.id
-    user_messages[user_id] = message.message_id
     
     if str(user_id) in user_accounts:
         await show_main_screen(user_id)
@@ -251,7 +249,7 @@ async def create_handler(message: types.Message):
         await show_main_screen(user_id)
     except Exception as e:
         logger.error(f"Create error: {e}")
-        await send_new_message(
+        await send_bot_message(
             user_id,
             f"❌ **Ошибка создания**\n\n{str(e)[:200]}",
             main_keyboard_no_account()
@@ -260,14 +258,13 @@ async def create_handler(message: types.Message):
 @dp.message_handler(lambda message: message.text == "📨 Проверить почту")
 async def check_handler(message: types.Message):
     user_id = message.from_user.id
-    user_messages[user_id] = message.message_id
     
     account = user_accounts.get(str(user_id))
     if not account:
         await show_main_screen(user_id)
         return
     
-    await send_new_message(user_id, "🔄 **Проверяю почту...**", None)
+    await send_bot_message(user_id, "🔄 **Проверяю почту...**", None)
     
     try:
         new = await check_mailcat(account)
@@ -276,7 +273,7 @@ async def check_handler(message: types.Message):
         
         messages = account.get('messages', [])
         if not messages:
-            await send_new_message(
+            await send_bot_message(
                 user_id,
                 "📭 **Писем нет**\n\nНажмите «Назад» для возврата",
                 back_keyboard()
@@ -300,11 +297,11 @@ async def check_handler(message: types.Message):
         
         text += f"\n📌 **Всего:** {len(messages)}"
         
-        await send_new_message(user_id, text, back_keyboard())
+        await send_bot_message(user_id, text, back_keyboard())
         
     except Exception as e:
         logger.error(f"Check error: {e}")
-        await send_new_message(
+        await send_bot_message(
             user_id,
             f"❌ **Ошибка проверки**\n\n{str(e)[:200]}",
             back_keyboard()
@@ -313,14 +310,13 @@ async def check_handler(message: types.Message):
 @dp.message_handler(lambda message: message.text == "🗑 Удалить ящик")
 async def delete_handler(message: types.Message):
     user_id = message.from_user.id
-    user_messages[user_id] = message.message_id
     
     account = user_accounts.get(str(user_id))
     if not account:
         await show_main_screen(user_id)
         return
     
-    await send_new_message(
+    await send_bot_message(
         user_id,
         f"⚠️ **Вы уверены, что хотите удалить ящик?**\n\n"
         f"📧 `{account['email']}`\n\n"
@@ -331,7 +327,6 @@ async def delete_handler(message: types.Message):
 @dp.message_handler(lambda message: message.text == "✅ Да, удалить")
 async def confirm_delete_handler(message: types.Message):
     user_id = message.from_user.id
-    user_messages[user_id] = message.message_id
     
     account = user_accounts.get(str(user_id))
     if not account:
@@ -347,7 +342,7 @@ async def confirm_delete_handler(message: types.Message):
     
     del user_accounts[str(user_id)]
     
-    await send_new_message(
+    await send_bot_message(
         user_id,
         "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости",
         main_keyboard_no_account()
@@ -356,19 +351,16 @@ async def confirm_delete_handler(message: types.Message):
 @dp.message_handler(lambda message: message.text == "❌ Отмена")
 async def cancel_delete_handler(message: types.Message):
     user_id = message.from_user.id
-    user_messages[user_id] = message.message_id
     await show_main_screen(user_id)
 
 @dp.message_handler(lambda message: message.text == "🔙 Назад")
 async def back_handler(message: types.Message):
     user_id = message.from_user.id
-    user_messages[user_id] = message.message_id
     await show_main_screen(user_id)
 
 @dp.message_handler()
 async def any_message(message: types.Message):
     user_id = message.from_user.id
-    user_messages[user_id] = message.message_id
     await show_main_screen(user_id)
 
 async def background_check():
