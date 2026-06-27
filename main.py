@@ -156,19 +156,12 @@ def extract_value(data):
         return data['value']
     return data
 
-def serialize_messages(messages):
-    if not messages:
-        return '[]'
-    return json.dumps(messages, ensure_ascii=False)
-
-def deserialize_messages(data):
-    """Превращает данные из Turso в список, что бы там ни лежало"""
-    if not data:
+def ensure_list(data):
+    """Приводит данные к списку"""
+    if data is None:
         return []
-    
     if isinstance(data, list):
         return data
-    
     if isinstance(data, str):
         try:
             parsed = json.loads(data)
@@ -177,13 +170,17 @@ def deserialize_messages(data):
             return [parsed] if parsed else []
         except:
             return []
-    
     if isinstance(data, dict):
-        if 'value' in data:
-            return [data['value']] if data['value'] else []
         return [data] if data else []
-    
     return [data] if data else []
+
+def serialize_messages(messages):
+    if not messages:
+        return '[]'
+    return json.dumps(messages, ensure_ascii=False)
+
+def deserialize_messages(data):
+    return ensure_list(data)
 
 async def init_db():
     sql = '''
@@ -213,19 +210,17 @@ async def get_user(user_id):
                 'email': str(extract_value(row[0])) if row[0] else '',
                 'token': str(extract_value(row[1])) if row[1] else '',
                 'account_id': str(extract_value(row[2])) if row[2] else '',
-                'messages': deserialize_messages(row[3]),
-                'read_ids': json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
+                'messages': ensure_list(row[3]),
+                'read_ids': ensure_list(row[4])
             }
         elif isinstance(row, dict):
             user_data = {
                 'email': str(extract_value(row.get('email', ''))),
                 'token': str(extract_value(row.get('token', ''))),
                 'account_id': str(extract_value(row.get('account_id', ''))),
-                'messages': deserialize_messages(row.get('messages', [])),
-                'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
+                'messages': ensure_list(row.get('messages', [])),
+                'read_ids': ensure_list(row.get('read_ids', []))
             }
-        if not isinstance(user_data.get('messages'), list):
-            user_data['messages'] = []
         return user_data
     return None
 
@@ -237,6 +232,9 @@ async def save_user(user_id, account):
     messages = account.get('messages', [])
     if not isinstance(messages, list):
         messages = []
+    read_ids = account.get('read_ids', [])
+    if not isinstance(read_ids, list):
+        read_ids = []
     sql = '''
         INSERT OR REPLACE INTO users (user_id, email, token, account_id, messages, read_ids)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -247,7 +245,7 @@ async def save_user(user_id, account):
         str(token),
         str(account_id),
         serialize_messages(messages),
-        json.dumps(account.get('read_ids', []))
+        json.dumps(read_ids)
     ])
 
 async def delete_user(user_id):
@@ -279,31 +277,22 @@ async def load_all_users_to_cache():
         if isinstance(row, (list, tuple)):
             if len(row) >= 6:
                 user_id = str(extract_value(row[0]))
-                messages = deserialize_messages(row[4])
-                if not isinstance(messages, list):
-                    messages = []
                 user_accounts_cache[user_id] = {
                     'email': str(extract_value(row[1])) if row[1] else '',
                     'token': str(extract_value(row[2])) if row[2] else '',
                     'account_id': str(extract_value(row[3])) if row[3] else '',
-                    'messages': messages,
-                    'read_ids': json.loads(row[5]) if isinstance(row[5], str) else (row[5] or [])
+                    'messages': ensure_list(row[4]),
+                    'read_ids': ensure_list(row[5])
                 }
         elif isinstance(row, dict):
             user_id = str(extract_value(row.get('user_id', '')))
-            messages = deserialize_messages(row.get('messages', []))
-            if not isinstance(messages, list):
-                messages = []
             user_accounts_cache[user_id] = {
                 'email': str(extract_value(row.get('email', ''))),
                 'token': str(extract_value(row.get('token', ''))),
                 'account_id': str(extract_value(row.get('account_id', ''))),
-                'messages': messages,
-                'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
+                'messages': ensure_list(row.get('messages', [])),
+                'read_ids': ensure_list(row.get('read_ids', []))
             }
-    for uid in user_accounts_cache:
-        if not isinstance(user_accounts_cache[uid].get('messages'), list):
-            user_accounts_cache[uid]['messages'] = []
     if rows:
         logger.info(f"✅ Loaded {len(rows)} users from Turso")
 
@@ -331,8 +320,11 @@ async def create_mailcat_mailbox():
             }
 
 async def check_mailcat(account):
+    # Принудительно приводим к списку
     if 'messages' not in account or not isinstance(account['messages'], list):
         account['messages'] = []
+    if 'read_ids' not in account or not isinstance(account['read_ids'], list):
+        account['read_ids'] = []
     
     async with aiohttp.ClientSession() as session:
         headers = {"Authorization": f"Bearer {account['token']}"}
@@ -345,8 +337,8 @@ async def check_mailcat(account):
         new_messages = []
         for msg in messages:
             msg_id = msg.get('id')
-            if msg_id not in account.get('read_ids', []):
-                account.setdefault('read_ids', []).append(msg_id)
+            if msg_id not in account['read_ids']:
+                account['read_ids'].append(msg_id)
                 async with session.get(f"{MAILCAT_API}/emails/{msg_id}", headers=headers) as resp2:
                     if resp2.status in [200, 201]:
                         full = await resp2.json()
@@ -512,6 +504,8 @@ async def check_handler(message: types.Message):
         return
     if not isinstance(account.get('messages'), list):
         account['messages'] = []
+    if not isinstance(account.get('read_ids'), list):
+        account['read_ids'] = []
     await send_bot_message(user_id, "🔄 **Проверяю...**", None)
     try:
         new = await check_mailcat(account)
@@ -633,8 +627,8 @@ async def background_check():
                     if account:
                         if not isinstance(account.get('messages'), list):
                             account['messages'] = []
-                            await save_user(user_id, account)
-                            logger.info(f"🔧 Fixed messages for {user_id}")
+                        if not isinstance(account.get('read_ids'), list):
+                            account['read_ids'] = []
                         new = await check_mailcat(account)
                         if new:
                             account['messages'].extend(new)
