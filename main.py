@@ -106,19 +106,14 @@ def decode_header_value(value):
         return value
 
 def clean_body(body):
-    """Очищает тело письма от мусора"""
     if not body:
         return ''
-    # Убираем HTML теги
     body = re.sub(r'<[^>]+>', ' ', body)
-    # Убираем множественные пробелы и переносы
     body = re.sub(r'\s+', ' ', body)
-    # Убираем base64 и прочий мусор
     body = re.sub(r'[A-Za-z0-9+/=]{50,}', '', body)
     return body[:500].strip()
 
 def extract_code(text):
-    """Находит код подтверждения"""
     if not text:
         return None
     patterns = [
@@ -148,7 +143,24 @@ def extract_links(text):
             clean_links.append(link)
     return clean_links
 
-# ===== БАЗА ДАННЫХ =====
+# ===== БАЗА ДАННЫХ (ИСПРАВЛЕННАЯ) =====
+def serialize_messages(messages):
+    if not messages:
+        return '[]'
+    return json.dumps(messages, ensure_ascii=False)
+
+def deserialize_messages(data):
+    if not data:
+        return []
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        except:
+            return []
+    if isinstance(data, (list, dict)):
+        return data
+    return []
+
 async def init_db():
     sql = '''
         CREATE TABLE IF NOT EXISTS users (
@@ -174,8 +186,8 @@ async def get_user(user_id):
             'email': row[0],
             'token': row[1],
             'account_id': row[2],
-            'messages': json.loads(row[3]) if row[3] else [],
-            'read_ids': json.loads(row[4]) if row[4] else []
+            'messages': deserialize_messages(row[3]),
+            'read_ids': json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
         }
     return None
 
@@ -189,7 +201,7 @@ async def save_user(user_id, account):
         account['email'],
         account['token'],
         account.get('account_id', ''),
-        json.dumps(account.get('messages', [])),
+        serialize_messages(account.get('messages', [])),
         json.dumps(account.get('read_ids', []))
     ])
 
@@ -217,8 +229,8 @@ async def load_all_users_to_cache():
             'email': row[1],
             'token': row[2],
             'account_id': row[3],
-            'messages': json.loads(row[4]) if row[4] else [],
-            'read_ids': json.loads(row[5]) if row[5] else []
+            'messages': deserialize_messages(row[4]),
+            'read_ids': json.loads(row[5]) if isinstance(row[5], str) else (row[5] or [])
         }
     if rows:
         logger.info(f"✅ Loaded {len(rows)} users from Turso")
