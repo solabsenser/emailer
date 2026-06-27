@@ -540,10 +540,9 @@ async def check_handler(message: types.Message):
             if msg.get('links'):
                 link = msg['links'][0]
                 if isinstance(link, str):
-                    link_preview = link[:80] + "..." if len(link) > 80 else link
+                    text += f"   🔗 {link}\n"
                 else:
-                    link_preview = str(link)[:80] + "..."
-                text += f"   🔗 {link_preview}\n"
+                    text += f"   🔗 {str(link)}\n"
             text += "\n"
         if len(valid_messages) > 10:
             text += f"... и еще {len(valid_messages)-10} писем\n"
