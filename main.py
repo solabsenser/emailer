@@ -20,7 +20,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
 
 # ===== ХРАНИЛИЩЕ =====
-user_accounts = {}  # {user_id: {email, token, messages: []}}
+user_accounts = {}
 user_messages = {}
 
 # ===== MAILCAT API =====
@@ -29,10 +29,11 @@ MAILCAT_API = "https://api.mailcat.ai"
 async def create_mailcat_mailbox():
     """Создает временный email через MailCat"""
     async with aiohttp.ClientSession() as session:
-        # Создаём ящик
         async with session.post(f"{MAILCAT_API}/mailboxes") as resp:
-            if resp.status != 200:
-                raise Exception(f"Failed: {resp.status}")
+            if resp.status not in [200, 201]:
+                error_text = await resp.text()
+                raise Exception(f"Failed: {resp.status} - {error_text}")
+            
             data = await resp.json()
             mailbox = data.get('data', {})
             
@@ -40,7 +41,7 @@ async def create_mailcat_mailbox():
             token = mailbox.get('token')
             
             if not email or not token:
-                raise Exception("Invalid response")
+                raise Exception(f"Invalid response: {data}")
             
             return {
                 'email': email,
@@ -54,9 +55,8 @@ async def check_mailcat(account):
     async with aiohttp.ClientSession() as session:
         headers = {"Authorization": f"Bearer {account['token']}"}
         
-        # Получаем список писем
         async with session.get(f"{MAILCAT_API}/inbox", headers=headers) as resp:
-            if resp.status != 200:
+            if resp.status not in [200, 201]:
                 return []
             data = await resp.json()
             messages = data.get('data', [])
@@ -67,13 +67,11 @@ async def check_mailcat(account):
             if msg_id not in account.get('read_ids', []):
                 account.setdefault('read_ids', []).append(msg_id)
                 
-                # Читаем письмо
                 async with session.get(f"{MAILCAT_API}/emails/{msg_id}", headers=headers) as resp2:
-                    if resp2.status == 200:
+                    if resp2.status in [200, 201]:
                         full = await resp2.json()
                         email_data = full.get('data', {})
                         
-                        # MailCat сам извлекает код подтверждения
                         code = email_data.get('code', '')
                         body = email_data.get('email', {}).get('text', '')
                         if not body:
@@ -164,7 +162,7 @@ async def create_callback(callback: types.CallbackQuery):
         )
     except Exception as e:
         logger.error(f"Create error: {e}")
-        await update_or_send(user_id, f"❌ **Ошибка:** {str(e)[:100]}", get_main_menu())
+        await update_or_send(user_id, f"❌ **Ошибка:** {str(e)[:200]}", get_main_menu())
 
 @dp.callback_query_handler(lambda c: c.data == "list")
 async def list_callback(callback: types.CallbackQuery):
@@ -195,15 +193,15 @@ async def check_callback(callback: types.CallbackQuery):
                 await update_or_send(
                     user_id,
                     f"✅ **{len(new)} новых писем!**\n\n"
-                    f"🔑 **Коды подтверждения:**\n" + "\n".join([f"• {c}" for c in codes[:5]]),
+                    f"🔑 **Коды подтверждения:**\n" + "\n".join([f"• `{c}`" for c in codes[:5]]),
                     get_main_menu()
                 )
             else:
-                await update_or_send(user_id, f"✅ **{len(new)} новых писем!**\n\nНажмите «Мои ящики»", get_main_menu())
+                await update_or_send(user_id, f"✅ **{len(new)} новых писем!**", get_main_menu())
         else:
             await update_or_send(user_id, f"📭 **Новых писем нет**\nВсего: {len(account.get('messages', []))}", get_main_menu())
     except Exception as e:
-        await update_or_send(user_id, f"❌ **Ошибка:** {str(e)[:100]}", get_main_menu())
+        await update_or_send(user_id, f"❌ **Ошибка:** {str(e)[:200]}", get_main_menu())
 
 @dp.callback_query_handler(lambda c: c.data.startswith("view_"))
 async def view_callback(callback: types.CallbackQuery):
@@ -244,14 +242,6 @@ async def delete_callback(callback: types.CallbackQuery):
     if not account:
         await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
         return
-    
-    # Удаляем через API
-    try:
-        async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Bearer {account['token']}"}
-            # MailCat удаляет ящик автоматически через час, но можно и самому
-    except:
-        pass
     
     del user_accounts[str(user_id)]
     await update_or_send(user_id, f"🗑 **Ящик удалён**", get_main_menu())
