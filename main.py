@@ -204,7 +204,6 @@ async def get_user(user_id):
                 'messages': deserialize_messages(row.get('messages', [])),
                 'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
             }
-        # Принудительная нормализация
         if not isinstance(user_data.get('messages'), list):
             user_data['messages'] = []
         return user_data
@@ -216,7 +215,6 @@ async def save_user(user_id, account):
     token = extract_value(account.get('token', ''))
     account_id = extract_value(account.get('account_id', ''))
     
-    # Гарантируем, что messages — это список
     messages = account.get('messages', [])
     if not isinstance(messages, list):
         messages = []
@@ -287,7 +285,6 @@ async def load_all_users_to_cache():
                 'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
             }
     
-    # Дополнительная нормализация для всех пользователей
     for uid in user_accounts_cache:
         if not isinstance(user_accounts_cache[uid].get('messages'), list):
             user_accounts_cache[uid]['messages'] = []
@@ -319,7 +316,6 @@ async def create_mailcat_mailbox():
             }
 
 async def check_mailcat(account):
-    # Принудительная нормализация
     if 'messages' not in account or not isinstance(account['messages'], list):
         account['messages'] = []
     
@@ -449,7 +445,6 @@ async def show_main_screen(user_id):
         )
         return
     
-    # Нормализуем messages в список
     if not isinstance(account.get('messages'), list):
         account['messages'] = []
     
@@ -524,7 +519,7 @@ async def check_handler(message: types.Message):
     await send_bot_message(user_id, "🔄 **Проверяю почту...**", None)
     try:
         new = await check_mailcat(account)
-        if new and isinstance(account['messages'], list):
+        if new:
             account['messages'].extend(new)
             await save_user(user_id, account)
         valid_messages = [m for m in account['messages'] if isinstance(m, dict)]
@@ -643,14 +638,13 @@ async def background_check():
                 try:
                     account = user_accounts_cache.get(user_id) or await get_user(user_id)
                     if account:
-                        # ПРИНУДИТЕЛЬНАЯ нормализация с перезаписью в БД
                         if not isinstance(account.get('messages'), list):
                             account['messages'] = []
                             await save_user(user_id, account)
-                            logger.info(f"🔧 Fixed messages format for user {user_id}")
+                            logger.info(f"🔧 Fixed messages for user {user_id}")
                         
                         new = await check_mailcat(account)
-                        if new and isinstance(account['messages'], list):
+                        if new:
                             account['messages'].extend(new)
                             await save_user(user_id, account)
                             
@@ -663,10 +657,10 @@ async def background_check():
                             if msg.get('links'):
                                 link = msg['links'][0]
                                 if isinstance(link, str):
-                                    link_preview = link[:60] + "..." if len(link) > 60 else link
+                                    text += f"🔗 {link}\n"
                                 else:
-                                    link_preview = str(link)[:60] + "..."
-                                text += f"🔗 {link_preview}\n"
+                                    text += f"🔗 {str(link)}\n"
+                            text += f"\n📌 Нажмите «Проверить почту» для просмотра"
                             await bot.send_message(int(user_id), text, parse_mode='Markdown')
                 except Exception as e:
                     logger.error(f"Background check error for {user_id}: {e}")
