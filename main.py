@@ -8,7 +8,7 @@ import email.header
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 import os
 
@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 # ===== ХРАНИЛИЩЕ =====
 user_accounts = {}
-user_messages = {}
+user_messages = {}  # только для редактирования
 
 def decode_header_value(value):
     if not value:
@@ -150,40 +150,47 @@ async def start_web():
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# ===== КЛАВИАТУРЫ =====
-def main_menu_no_account():
-    keyboard = InlineKeyboardMarkup(row_width=1)
+# ===== REPLY-КЛАВИАТУРЫ =====
+def main_keyboard_no_account():
+    """Клавиатура когда нет ящика"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    keyboard.add(KeyboardButton("📧 Создать почту"))
+    return keyboard
+
+def main_keyboard_with_account():
+    """Клавиатура когда есть ящик"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     keyboard.add(
-        InlineKeyboardButton("📧 Создать почту", callback_data="create")
+        KeyboardButton("📨 Проверить почту"),
+        KeyboardButton("🗑 Удалить ящик")
     )
     return keyboard
 
-def main_menu_with_account(email, msg_count, code_count):
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton(f"📨 Почта ({msg_count})", callback_data="check"),
-        InlineKeyboardButton("🗑 Удалить", callback_data="delete")
-    )
+def back_keyboard():
+    """Клавиатура для возврата"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    keyboard.add(KeyboardButton("🔙 Назад"))
     return keyboard
 
-def back_menu():
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
-    )
-    return keyboard
+async def send_message(user_id, text, reply_markup=None):
+    """Отправляет новое сообщение и запоминает его ID"""
+    try:
+        sent = await bot.send_message(
+            user_id,
+            text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+        user_messages[user_id] = sent.message_id
+        return sent
+    except Exception as e:
+        logger.error(f"Send error: {e}")
+        return None
 
-def confirm_delete_menu():
-    """Меню подтверждения удаления"""
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("✅ Да, удалить", callback_data="confirm_delete"),
-        InlineKeyboardButton("❌ Отмена", callback_data="back_to_main")
-    )
-    return keyboard
-
-async def update_or_send(user_id, text, reply_markup=None):
+async def edit_or_send(user_id, text, reply_markup=None):
+    """Редактирует или отправляет новое сообщение"""
     msg_id = user_messages.get(user_id)
+    
     if msg_id:
         try:
             await bot.edit_message_text(
@@ -202,27 +209,20 @@ async def update_or_send(user_id, text, reply_markup=None):
             else:
                 logger.error(f"Edit error: {e}")
                 user_messages.pop(user_id, None)
-    try:
-        sent = await bot.send_message(
-            user_id,
-            text,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-        user_messages[user_id] = sent.message_id
-    except Exception as e:
-        logger.error(f"Send error: {e}")
+    
+    await send_message(user_id, text, reply_markup)
 
 async def show_main_screen(user_id):
+    """Показывает главный экран"""
     account = user_accounts.get(str(user_id))
     
     if not account:
-        await update_or_send(
+        await edit_or_send(
             user_id,
             "📧 **Временная почта**\n\n"
             "Создайте временный email для регистрации\n"
             "Письма приходят автоматически",
-            main_menu_no_account()
+            main_keyboard_no_account()
         )
         return
     
@@ -235,10 +235,10 @@ async def show_main_screen(user_id):
     if code_count:
         text += f"🔑 Кодов: **{code_count}**"
     
-    await update_or_send(
+    await edit_or_send(
         user_id,
         text,
-        main_menu_with_account(account['email'], msg_count, code_count)
+        main_keyboard_with_account()
     )
 
 @dp.message_handler(commands=['start', 'menu'])
@@ -247,16 +247,10 @@ async def start(message: types.Message):
     user_messages[user_id] = message.message_id
     await show_main_screen(user_id)
 
-@dp.message_handler()
-async def any_message(message: types.Message):
+@dp.message_handler(lambda message: message.text == "📧 Создать почту")
+async def create_handler(message: types.Message):
     user_id = message.from_user.id
     user_messages[user_id] = message.message_id
-    await show_main_screen(user_id)
-
-@dp.callback_query_handler(lambda c: c.data == "create")
-async def create_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
     
     if str(user_id) in user_accounts:
         await show_main_screen(user_id)
@@ -268,23 +262,23 @@ async def create_callback(callback: types.CallbackQuery):
         await show_main_screen(user_id)
     except Exception as e:
         logger.error(f"Create error: {e}")
-        await update_or_send(
+        await edit_or_send(
             user_id,
             f"❌ **Ошибка создания**\n\n{str(e)[:200]}",
-            main_menu_no_account()
+            main_keyboard_no_account()
         )
 
-@dp.callback_query_handler(lambda c: c.data == "check")
-async def check_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
+@dp.message_handler(lambda message: message.text == "📨 Проверить почту")
+async def check_handler(message: types.Message):
+    user_id = message.from_user.id
+    user_messages[user_id] = message.message_id
     
     account = user_accounts.get(str(user_id))
     if not account:
         await show_main_screen(user_id)
         return
     
-    await update_or_send(user_id, "🔄 **Проверяю почту...**", None)
+    await edit_or_send(user_id, "🔄 **Проверяю почту...**", None)
     
     try:
         new = await check_mailcat(account)
@@ -293,10 +287,10 @@ async def check_callback(callback: types.CallbackQuery):
         
         messages = account.get('messages', [])
         if not messages:
-            await update_or_send(
+            await edit_or_send(
                 user_id,
                 "📭 **Писем нет**\n\nНажмите «Назад» для возврата",
-                back_menu()
+                back_keyboard()
             )
             return
         
@@ -317,50 +311,27 @@ async def check_callback(callback: types.CallbackQuery):
         
         text += f"\n📌 **Всего:** {len(messages)}"
         
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            InlineKeyboardButton("🔄 Обновить", callback_data="check"),
-            InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
-        )
-        
-        await update_or_send(user_id, text, keyboard)
+        await edit_or_send(user_id, text, back_keyboard())
         
     except Exception as e:
         logger.error(f"Check error: {e}")
-        await update_or_send(
+        await edit_or_send(
             user_id,
             f"❌ **Ошибка проверки**\n\n{str(e)[:200]}",
-            back_menu()
+            back_keyboard()
         )
 
-@dp.callback_query_handler(lambda c: c.data == "delete")
-async def delete_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
+@dp.message_handler(lambda message: message.text == "🗑 Удалить ящик")
+async def delete_handler(message: types.Message):
+    user_id = message.from_user.id
+    user_messages[user_id] = message.message_id
     
     account = user_accounts.get(str(user_id))
     if not account:
         await show_main_screen(user_id)
         return
     
-    await update_or_send(
-        user_id,
-        f"⚠️ **Вы уверены, что хотите удалить ящик?**\n\n"
-        f"📧 `{account['email']}`\n\n"
-        f"Все письма будут удалены безвозвратно.",
-        confirm_delete_menu()
-    )
-
-@dp.callback_query_handler(lambda c: c.data == "confirm_delete")
-async def confirm_delete_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
-    
-    account = user_accounts.get(str(user_id))
-    if not account:
-        await show_main_screen(user_id)
-        return
-    
+    # Удаляем без подтверждения (можно добавить потом)
     try:
         async with aiohttp.ClientSession() as session:
             headers = {"Authorization": f"Bearer {account['token']}"}
@@ -370,16 +341,22 @@ async def confirm_delete_callback(callback: types.CallbackQuery):
     
     del user_accounts[str(user_id)]
     
-    await update_or_send(
+    await edit_or_send(
         user_id,
         "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости",
-        main_menu_no_account()
+        main_keyboard_no_account()
     )
 
-@dp.callback_query_handler(lambda c: c.data == "back_to_main")
-async def back_to_main_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
+@dp.message_handler(lambda message: message.text == "🔙 Назад")
+async def back_handler(message: types.Message):
+    user_id = message.from_user.id
+    user_messages[user_id] = message.message_id
+    await show_main_screen(user_id)
+
+@dp.message_handler()
+async def any_message(message: types.Message):
+    user_id = message.from_user.id
+    user_messages[user_id] = message.message_id
     await show_main_screen(user_id)
 
 async def background_check():
