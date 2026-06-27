@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 # ===== ХРАНИЛИЩЕ =====
 user_accounts = {}
-user_messages = {}  # только для редактирования
+user_messages = {}
 
 def decode_header_value(value):
     if not value:
@@ -152,13 +152,11 @@ dp = Dispatcher(bot)
 
 # ===== REPLY-КЛАВИАТУРЫ =====
 def main_keyboard_no_account():
-    """Клавиатура когда нет ящика"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
     keyboard.add(KeyboardButton("📧 Создать почту"))
     return keyboard
 
 def main_keyboard_with_account():
-    """Клавиатура когда есть ящик"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     keyboard.add(
         KeyboardButton("📨 Проверить почту"),
@@ -167,13 +165,20 @@ def main_keyboard_with_account():
     return keyboard
 
 def back_keyboard():
-    """Клавиатура для возврата"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
     keyboard.add(KeyboardButton("🔙 Назад"))
     return keyboard
 
+def confirm_delete_keyboard():
+    """Клавиатура подтверждения удаления"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(
+        KeyboardButton("✅ Да, удалить"),
+        KeyboardButton("❌ Отмена")
+    )
+    return keyboard
+
 async def send_message(user_id, text, reply_markup=None):
-    """Отправляет новое сообщение и запоминает его ID"""
     try:
         sent = await bot.send_message(
             user_id,
@@ -188,7 +193,6 @@ async def send_message(user_id, text, reply_markup=None):
         return None
 
 async def edit_or_send(user_id, text, reply_markup=None):
-    """Редактирует или отправляет новое сообщение"""
     msg_id = user_messages.get(user_id)
     
     if msg_id:
@@ -213,7 +217,6 @@ async def edit_or_send(user_id, text, reply_markup=None):
     await send_message(user_id, text, reply_markup)
 
 async def show_main_screen(user_id):
-    """Показывает главный экран"""
     account = user_accounts.get(str(user_id))
     
     if not account:
@@ -331,7 +334,24 @@ async def delete_handler(message: types.Message):
         await show_main_screen(user_id)
         return
     
-    # Удаляем без подтверждения (можно добавить потом)
+    await edit_or_send(
+        user_id,
+        f"⚠️ **Вы уверены, что хотите удалить ящик?**\n\n"
+        f"📧 `{account['email']}`\n\n"
+        f"Все письма будут удалены безвозвратно.",
+        confirm_delete_keyboard()
+    )
+
+@dp.message_handler(lambda message: message.text == "✅ Да, удалить")
+async def confirm_delete_handler(message: types.Message):
+    user_id = message.from_user.id
+    user_messages[user_id] = message.message_id
+    
+    account = user_accounts.get(str(user_id))
+    if not account:
+        await show_main_screen(user_id)
+        return
+    
     try:
         async with aiohttp.ClientSession() as session:
             headers = {"Authorization": f"Bearer {account['token']}"}
@@ -346,6 +366,12 @@ async def delete_handler(message: types.Message):
         "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости",
         main_keyboard_no_account()
     )
+
+@dp.message_handler(lambda message: message.text == "❌ Отмена")
+async def cancel_delete_handler(message: types.Message):
+    user_id = message.from_user.id
+    user_messages[user_id] = message.message_id
+    await show_main_screen(user_id)
 
 @dp.message_handler(lambda message: message.text == "🔙 Назад")
 async def back_handler(message: types.Message):
