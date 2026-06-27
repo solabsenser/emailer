@@ -24,21 +24,38 @@ TURSO_URL = os.getenv("TURSO_URL")
 TURSO_TOKEN = os.getenv("TURSO_TOKEN")
 
 if not TURSO_URL or not TURSO_TOKEN:
-    logger.error("❌ TURSO_URL or TURSO_TOKEN not set in .env")
+    logger.error("❌ TURSO_URL or TURSO_TOKEN not set")
     exit(1)
 
-# ===== TURSO БАЗА ДАННЫХ =====
-try:
-    from libsql_experimental import sqlite3 as libsql_conn
-    client = libsql_conn.connect(TURSO_URL)
-    client.execute("PRAGMA journal_mode=WAL")
-    logger.info("✅ Connected to Turso")
-except Exception as e:
-    logger.error(f"❌ Turso connection failed: {e}")
-    exit(1)
+# ===== TURSO HTTP API =====
+class TursoClient:
+    def __init__(self, url, token):
+        self.url = url
+        self.token = token
+    
+    async def execute(self, sql, params=None):
+        """Выполняет SQL через HTTP API"""
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "statements": [{"sql": sql, "args": params or []}]
+            }
+            
+            async with session.post(self.url, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    raise Exception(f"Turso error: {error}")
+                data = await resp.json()
+                return data
 
-def init_db():
-    client.execute('''
+turso = TursoClient(TURSO_URL, TURSO_TOKEN)
+
+async def init_db():
+    """Инициализация базы данных"""
+    sql = '''
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
             email TEXT,
@@ -48,18 +65,17 @@ def init_db():
             read_ids TEXT DEFAULT '[]',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
-    client.commit()
+    '''
+    await turso.execute(sql)
     logger.info("✅ Database initialized")
 
-def get_user(user_id):
-    cursor = client.execute(
-        'SELECT email, token, account_id, messages, read_ids FROM users WHERE user_id = ?',
-        (user_id,)
-    )
-    row = cursor.fetchone()
+async def get_user(user_id):
+    sql = 'SELECT email, token, account_id, messages, read_ids FROM users WHERE user_id = ?'
+    result = await turso.execute(sql, [user_id])
     
-    if row:
+    rows = result.get('result', {}).get('rows', [])
+    if rows:
+        row = rows[0]
         return {
             'email': row[0],
             'token': row[1],
@@ -69,35 +85,38 @@ def get_user(user_id):
         }
     return None
 
-def save_user(user_id, account):
-    client.execute('''
+async def save_user(user_id, account):
+    sql = '''
         INSERT OR REPLACE INTO users (user_id, email, token, account_id, messages, read_ids)
         VALUES (?, ?, ?, ?, ?, ?)
-    ''', (
+    '''
+    await turso.execute(sql, [
         user_id,
         account['email'],
         account['token'],
         account.get('account_id', ''),
         json.dumps(account.get('messages', [])),
         json.dumps(account.get('read_ids', []))
-    ))
-    client.commit()
+    ])
 
-def delete_user(user_id):
-    client.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
-    client.commit()
+async def delete_user(user_id):
+    sql = 'DELETE FROM users WHERE user_id = ?'
+    await turso.execute(sql, [user_id])
 
-def get_all_users():
-    cursor = client.execute('SELECT user_id FROM users')
-    return [row[0] for row in cursor.fetchall()]
+async def get_all_users():
+    sql = 'SELECT user_id FROM users'
+    result = await turso.execute(sql)
+    rows = result.get('result', {}).get('rows', [])
+    return [row[0] for row in rows]
 
 # ===== ХРАНИЛИЩЕ (кэш в памяти) =====
 user_accounts_cache = {}
 bot_messages = {}
 
-def load_all_users_to_cache():
-    cursor = client.execute('SELECT user_id, email, token, account_id, messages, read_ids FROM users')
-    rows = cursor.fetchall()
+async def load_all_users_to_cache():
+    sql = 'SELECT user_id, email, token, account_id, messages, read_ids FROM users'
+    result = await turso.execute(sql)
+    rows = result.get('result', {}).get('rows', [])
     
     for row in rows:
         user_id = row[0]
@@ -291,7 +310,7 @@ async def send_bot_message(user_id, text, reply_markup=None):
 async def show_main_screen(user_id):
     account = user_accounts_cache.get(str(user_id))
     if not account:
-        account = get_user(str(user_id))
+        account = await get_user(str(user_id))
         if account:
             user_accounts_cache[str(user_id)] = account
     
@@ -323,7 +342,7 @@ async def show_main_screen(user_id):
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     user_id = str(message.from_user.id)
-    account = user_accounts_cache.get(user_id) or get_user(user_id)
+    account = user_accounts_cache.get(user_id) or await get_user(user_id)
     await send_bot_message(
         user_id,
         "👋 **Добро пожаловать!**\n\n"
@@ -348,7 +367,7 @@ async def create_handler(message: types.Message):
     try:
         account = await create_mailcat_mailbox()
         user_accounts_cache[user_id] = account
-        save_user(user_id, account)
+        await save_user(user_id, account)
         await show_main_screen(user_id)
     except Exception as e:
         logger.error(f"Create error: {e}")
@@ -367,7 +386,7 @@ async def check_handler(message: types.Message):
     except:
         pass
     
-    account = user_accounts_cache.get(user_id) or get_user(user_id)
+    account = user_accounts_cache.get(user_id) or await get_user(user_id)
     if not account:
         await show_main_screen(user_id)
         return
@@ -378,7 +397,7 @@ async def check_handler(message: types.Message):
         new = await check_mailcat(account)
         if new:
             account.setdefault('messages', []).extend(new)
-            save_user(user_id, account)
+            await save_user(user_id, account)
         
         messages = account.get('messages', [])
         if not messages:
@@ -425,7 +444,7 @@ async def delete_handler(message: types.Message):
     except:
         pass
     
-    account = user_accounts_cache.get(user_id) or get_user(user_id)
+    account = user_accounts_cache.get(user_id) or await get_user(user_id)
     if not account:
         await show_main_screen(user_id)
         return
@@ -447,7 +466,7 @@ async def confirm_delete_handler(message: types.Message):
     except:
         pass
     
-    account = user_accounts_cache.get(user_id) or get_user(user_id)
+    account = user_accounts_cache.get(user_id) or await get_user(user_id)
     if not account:
         await show_main_screen(user_id)
         return
@@ -460,7 +479,7 @@ async def confirm_delete_handler(message: types.Message):
         pass
     
     user_accounts_cache.pop(user_id, None)
-    delete_user(user_id)
+    await delete_user(user_id)
     
     await send_bot_message(
         user_id,
@@ -498,14 +517,15 @@ async def any_message(message: types.Message):
 async def background_check():
     while True:
         try:
-            for user_id in get_all_users():
-                account = user_accounts_cache.get(user_id) or get_user(user_id)
+            users = await get_all_users()
+            for user_id in users:
+                account = user_accounts_cache.get(user_id) or await get_user(user_id)
                 if account:
                     try:
                         new = await check_mailcat(account)
                         if new:
                             account.setdefault('messages', []).extend(new)
-                            save_user(user_id, account)
+                            await save_user(user_id, account)
                             msg = new[0]
                             text = f"📨 **Новое письмо!**\n\n"
                             text += f"От: {msg['sender'][:35]}\n"
@@ -523,10 +543,10 @@ async def background_check():
 
 async def main():
     # Инициализация БД
-    init_db()
+    await init_db()
     
     # Загружаем всех пользователей в кэш
-    load_all_users_to_cache()
+    await load_all_users_to_cache()
     
     await start_web()
     asyncio.create_task(background_check())
