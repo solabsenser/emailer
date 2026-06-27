@@ -32,7 +32,6 @@ if TURSO_URL.startswith("libsql://"):
     TURSO_URL = TURSO_URL.replace("libsql://", "https://")
     logger.info(f"✅ Converted to HTTPS: {TURSO_URL}")
 
-# Убираем порт если есть
 TURSO_URL = TURSO_URL.replace(":443", "").rstrip("/")
 
 # ===== TURSO HTTP API =====
@@ -144,6 +143,12 @@ def extract_links(text):
     return clean_links
 
 # ===== БАЗА ДАННЫХ =====
+def extract_value(data):
+    """Извлекает значение из Turso-формата {'type': 'text', 'value': '...'}"""
+    if isinstance(data, dict) and 'value' in data:
+        return data['value']
+    return data
+
 def serialize_messages(messages):
     if not messages:
         return '[]'
@@ -185,17 +190,17 @@ async def get_user(user_id):
         row = rows[0]
         if isinstance(row, (list, tuple)):
             return {
-                'email': str(row[0]) if row[0] else '',
-                'token': str(row[1]) if row[1] else '',
-                'account_id': str(row[2]) if row[2] else '',
+                'email': str(extract_value(row[0])) if row[0] else '',
+                'token': str(extract_value(row[1])) if row[1] else '',
+                'account_id': str(extract_value(row[2])) if row[2] else '',
                 'messages': deserialize_messages(row[3]),
                 'read_ids': json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
             }
         elif isinstance(row, dict):
             return {
-                'email': str(row.get('email', '')),
-                'token': str(row.get('token', '')),
-                'account_id': str(row.get('account_id', '')),
+                'email': str(extract_value(row.get('email', ''))),
+                'token': str(extract_value(row.get('token', ''))),
+                'account_id': str(extract_value(row.get('account_id', ''))),
                 'messages': deserialize_messages(row.get('messages', [])),
                 'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
             }
@@ -203,15 +208,19 @@ async def get_user(user_id):
 
 async def save_user(user_id, account):
     user_id = str(user_id)
+    email = extract_value(account.get('email', ''))
+    token = extract_value(account.get('token', ''))
+    account_id = extract_value(account.get('account_id', ''))
+    
     sql = '''
         INSERT OR REPLACE INTO users (user_id, email, token, account_id, messages, read_ids)
         VALUES (?, ?, ?, ?, ?, ?)
     '''
     await turso.execute(sql, [
         user_id,
-        account['email'],
-        account['token'],
-        account.get('account_id', ''),
+        str(email),
+        str(token),
+        str(account_id),
         serialize_messages(account.get('messages', [])),
         json.dumps(account.get('read_ids', []))
     ])
@@ -228,9 +237,9 @@ async def get_all_users():
     user_ids = []
     for row in rows:
         if isinstance(row, (list, tuple)):
-            user_ids.append(str(row[0]))
+            user_ids.append(str(extract_value(row[0])))
         elif isinstance(row, dict):
-            user_ids.append(str(row.get('user_id', '')))
+            user_ids.append(str(extract_value(row.get('user_id', ''))))
     return user_ids
 
 # ===== ХРАНИЛИЩЕ =====
@@ -240,26 +249,25 @@ bot_messages = {}
 async def load_all_users_to_cache():
     sql = 'SELECT user_id, email, token, account_id, messages, read_ids FROM users'
     result = await turso.execute(sql)
-    
     rows = result.get('result', {}).get('rows', [])
     
     for row in rows:
         if isinstance(row, (list, tuple)):
             if len(row) >= 6:
-                user_id = str(row[0])
+                user_id = str(extract_value(row[0]))
                 user_accounts_cache[user_id] = {
-                    'email': str(row[1]) if row[1] else '',
-                    'token': str(row[2]) if row[2] else '',
-                    'account_id': str(row[3]) if row[3] else '',
+                    'email': str(extract_value(row[1])) if row[1] else '',
+                    'token': str(extract_value(row[2])) if row[2] else '',
+                    'account_id': str(extract_value(row[3])) if row[3] else '',
                     'messages': deserialize_messages(row[4]),
                     'read_ids': json.loads(row[5]) if isinstance(row[5], str) else (row[5] or [])
                 }
         elif isinstance(row, dict):
-            user_id = str(row.get('user_id', ''))
+            user_id = str(extract_value(row.get('user_id', '')))
             user_accounts_cache[user_id] = {
-                'email': str(row.get('email', '')),
-                'token': str(row.get('token', '')),
-                'account_id': str(row.get('account_id', '')),
+                'email': str(extract_value(row.get('email', ''))),
+                'token': str(extract_value(row.get('token', ''))),
+                'account_id': str(extract_value(row.get('account_id', ''))),
                 'messages': deserialize_messages(row.get('messages', [])),
                 'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
             }
@@ -421,7 +429,6 @@ async def show_main_screen(user_id):
         return
     
     messages = account.get('messages', [])
-    # Фильтруем только словари
     valid_messages = [m for m in messages if isinstance(m, dict)]
     msg_count = len(valid_messages)
     codes = [m.get('code') for m in valid_messages if m.get('code')]
@@ -499,7 +506,6 @@ async def check_handler(message: types.Message):
             await save_user(user_id, account)
         
         messages = account.get('messages', [])
-        # Фильтруем только словари
         valid_messages = [m for m in messages if isinstance(m, dict)]
         
         if not valid_messages:
