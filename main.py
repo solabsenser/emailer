@@ -150,9 +150,8 @@ async def start_web():
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# ===== НОВЫЕ КЛАВИАТУРЫ =====
+# ===== КЛАВИАТУРЫ =====
 def main_menu_no_account():
-    """Главное меню, когда нет ящика"""
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton("📧 Создать почту", callback_data="create")
@@ -160,7 +159,6 @@ def main_menu_no_account():
     return keyboard
 
 def main_menu_with_account(email, msg_count, code_count):
-    """Главное меню, когда есть ящик"""
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         InlineKeyboardButton(f"📨 Почта ({msg_count})", callback_data="check"),
@@ -169,10 +167,18 @@ def main_menu_with_account(email, msg_count, code_count):
     return keyboard
 
 def back_menu():
-    """Кнопка назад"""
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
+    )
+    return keyboard
+
+def confirm_delete_menu():
+    """Меню подтверждения удаления"""
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("✅ Да, удалить", callback_data="confirm_delete"),
+        InlineKeyboardButton("❌ Отмена", callback_data="back_to_main")
     )
     return keyboard
 
@@ -208,7 +214,6 @@ async def update_or_send(user_id, text, reply_markup=None):
         logger.error(f"Send error: {e}")
 
 async def show_main_screen(user_id):
-    """Показывает главный экран"""
     account = user_accounts.get(str(user_id))
     
     if not account:
@@ -279,7 +284,6 @@ async def check_callback(callback: types.CallbackQuery):
         await show_main_screen(user_id)
         return
     
-    # Проверяем почту
     await update_or_send(user_id, "🔄 **Проверяю почту...**", None)
     
     try:
@@ -296,7 +300,6 @@ async def check_callback(callback: types.CallbackQuery):
             )
             return
         
-        # Показываем список писем
         text = f"📩 **Письма ({len(messages)}):**\n\n"
         for i, msg in enumerate(messages[-10:][::-1], 1):
             time = msg['received_at'].strftime('%H:%M')
@@ -340,7 +343,33 @@ async def delete_callback(callback: types.CallbackQuery):
         await show_main_screen(user_id)
         return
     
+    await update_or_send(
+        user_id,
+        f"⚠️ **Вы уверены, что хотите удалить ящик?**\n\n"
+        f"📧 `{account['email']}`\n\n"
+        f"Все письма будут удалены безвозвратно.",
+        confirm_delete_menu()
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "confirm_delete")
+async def confirm_delete_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.answer()
+    
+    account = user_accounts.get(str(user_id))
+    if not account:
+        await show_main_screen(user_id)
+        return
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"Bearer {account['token']}"}
+            await session.delete(f"{MAILCAT_API}/mailboxes", headers=headers)
+    except:
+        pass
+    
     del user_accounts[str(user_id)]
+    
     await update_or_send(
         user_id,
         "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости",
@@ -361,8 +390,6 @@ async def background_check():
                     new = await check_mailcat(account)
                     if new:
                         account.setdefault('messages', []).extend(new)
-                        
-                        # Формируем уведомление
                         msg = new[0]
                         text = f"📨 **Новое письмо!**\n\n"
                         text += f"От: {msg['sender'][:35]}\n"
@@ -371,7 +398,6 @@ async def background_check():
                             text += f"🔑 Код: `{msg['code']}`\n"
                         if msg.get('links'):
                             text += f"🔗 {msg['links'][0][:60]}"
-                        
                         await bot.send_message(int(user_id), text, parse_mode='Markdown')
                 except:
                     pass
