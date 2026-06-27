@@ -13,7 +13,6 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 import os
-from bs4 import BeautifulSoup  # <-- ДОБАВЛЯЕМ
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -102,70 +101,27 @@ def decode_header_value(value):
     except:
         return value
 
-def decode_quoted_printable(text):
+def extract_links_from_text(text):
     if not text:
-        return ''
-    try:
-        text = text.replace('\\-', '-').replace('\\.', '.').replace('\\=', '=')
-        decoded = quopri.decodestring(text.encode('utf-8'))
-        for encoding in ['utf-8', 'windows-1251', 'koi8-r']:
-            try:
-                result = decoded.decode(encoding, errors='ignore')
-                result = re.sub(r'=\s*\n', ' ', result)
-                result = re.sub(r'=\s*$', ' ', result)
-                return result
-            except:
-                continue
-        return decoded.decode('utf-8', errors='ignore')
-    except Exception as e:
-        logger.error(f"Decode error: {e}")
-        return text
-
-def extract_links_from_html(html):
-    if not html:
         return []
-    hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', html, re.IGNORECASE)
-    urls = re.findall(r'https?://[^\s<>"]+', html)
-    all_links = hrefs + urls
+    url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+    links = re.findall(url_pattern, text)
     clean = []
-    for link in all_links:
+    for link in links:
         link = link.strip('.,;:!?()[]{}"\'')
         if link.startswith('http') or link.startswith('www'):
             clean.append(link)
     return clean
 
-def clean_text_from_email(html):
-    """Парсит HTML и извлекает чистый текст через BeautifulSoup"""
+def clean_html_fallback(html):
+    """Запасной метод очистки HTML без BeautifulSoup"""
     if not html:
         return ''
-    
-    try:
-        # Декодируем quoted-printable
-        html = decode_quoted_printable(html)
-        
-        # Парсим HTML через BeautifulSoup
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # Убираем все скрипты и стили
-        for script in soup(["script", "style"]):
-            script.decompose()
-        
-        # Получаем текст
-        text = soup.get_text()
-        
-        # Убираем множественные пробелы и переносы
-        text = re.sub(r'\s+', ' ', text)
-        
-        return text.strip()
-    except Exception as e:
-        logger.error(f"BeautifulSoup error: {e}")
-        # Fallback
-        html = decode_quoted_printable(html)
-        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
-        html = re.sub(r'<[^>]+>', ' ', html)
-        html = re.sub(r'\{[^}]*\}', '', html)
-        html = re.sub(r'\s+', ' ', html)
-        return html.strip()
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
+    html = re.sub(r'<[^>]+>', ' ', html)
+    html = re.sub(r'\{[^}]*\}', '', html)
+    html = re.sub(r'\s+', ' ', html)
+    return html.strip()
 
 def find_confirmation_link(links):
     if not links:
@@ -381,35 +337,23 @@ async def check_mailcat(account):
                         raw_from = email_data.get('email', {}).get('from', 'unknown')
                         sender = decode_header_value(raw_from)
                         
-                        html = email_data.get('email', {}).get('html', '')
-                        text = email_data.get('email', {}).get('text', '')
-                        
-                        # Очищаем текст через BeautifulSoup
-                        clean_text = clean_text_from_email(html)
+                        # Берём текстовую версию (уже декодирована mailcat'ом)
+                        clean_text = email_data.get('email', {}).get('text', '')
+                        # Если нет текстовой — чистим HTML
                         if not clean_text:
-                            clean_text = clean_text_from_email(text)
+                            html = email_data.get('email', {}).get('html', '')
+                            clean_text = clean_html_fallback(html)
                         
-                        # Извлекаем все ссылки
-                        all_links = extract_links_from_html(html) + extract_links_from_html(clean_text)
-                        
-                        # Убираем дубли
-                        unique_links = []
-                        for link in all_links:
-                            if link not in unique_links:
-                                unique_links.append(link)
-                        
-                        # Находим ссылку для подтверждения
-                        confirm_link = find_confirmation_link(unique_links)
-                        
-                        # Сохраняем только ссылку для подтверждения
-                        links_to_save = [confirm_link] if confirm_link else []
+                        # Извлекаем ссылки
+                        all_links = extract_links_from_text(clean_text)
+                        confirm_link = find_confirmation_link(all_links)
                         
                         new_messages.append({
                             'sender': sender,
                             'subject': subject,
                             'body': clean_text[:500],
                             'code': None,
-                            'links': links_to_save,
+                            'links': [confirm_link] if confirm_link else [],
                             'received_at': datetime.now().isoformat()
                         })
         return new_messages
@@ -762,11 +706,17 @@ async def main():
         await load_all_users_to_cache()
         await start_web()
         asyncio.create_task(background_check())
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-            logger.info("✅ Webhook deleted")
-        except:
-            pass
+        
+        # Принудительное удаление webhook
+        for attempt in range(5):
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                logger.info("✅ Webhook deleted")
+                break
+            except Exception as e:
+                logger.warning(f"Webhook delete attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(2)
+        
         logger.info("🚀 Bot started")
         while True:
             try:
@@ -774,8 +724,8 @@ async def main():
                 break
             except Exception as e:
                 if "ConflictError" in str(e) or "TerminatedByOtherGetUpdates" in str(e):
-                    logger.warning("⚠️ Conflict detected, waiting 5 seconds...")
-                    await asyncio.sleep(5)
+                    logger.warning("⚠️ Conflict detected, waiting 10 seconds...")
+                    await asyncio.sleep(10)
                 else:
                     logger.error(f"Polling error: {e}")
                     await asyncio.sleep(5)
