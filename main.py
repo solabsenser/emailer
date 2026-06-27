@@ -5,7 +5,6 @@ import string
 import aiohttp
 import re
 import email.header
-import sqlite3
 import json
 from datetime import datetime
 from aiohttp import web
@@ -21,15 +20,25 @@ logger = logging.getLogger(__name__)
 # ===== КОНФИГ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
-DB_PATH = os.getenv("DB_PATH", "data.db")
+TURSO_URL = os.getenv("TURSO_URL")
+TURSO_TOKEN = os.getenv("TURSO_TOKEN")
 
-# ===== БАЗА ДАННЫХ =====
+# ===== TURSO БАЗА ДАННЫХ =====
+try:
+    from libsql_client import create_client_sync
+    client = create_client_sync(TURSO_URL, auth_token=TURSO_TOKEN)
+    logger.info("✅ Connected to Turso")
+except Exception as e:
+    logger.error(f"❌ Turso connection failed: {e}")
+    # Для локального теста без Turso
+    client = None
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    if not client:
+        logger.warning("⚠️ Turso not available, using fallback SQLite")
+        return
     
-    # Таблица пользователей и их ящиков
-    cursor.execute('''
+    client.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
             email TEXT,
@@ -40,17 +49,17 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
-    conn.commit()
-    conn.close()
     logger.info("✅ Database initialized")
 
 def get_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT email, token, account_id, messages, read_ids FROM users WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
-    conn.close()
+    if not client:
+        return None
+    
+    result = client.execute(
+        'SELECT email, token, account_id, messages, read_ids FROM users WHERE user_id = ?',
+        (user_id,)
+    )
+    row = result.fetchone()
     
     if row:
         return {
@@ -63,9 +72,10 @@ def get_user(user_id):
     return None
 
 def save_user(user_id, account):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
+    if not client:
+        return
+    
+    client.execute('''
         INSERT OR REPLACE INTO users (user_id, email, token, account_id, messages, read_ids)
         VALUES (?, ?, ?, ?, ?, ?)
     ''', (
@@ -76,44 +86,30 @@ def save_user(user_id, account):
         json.dumps(account.get('messages', [])),
         json.dumps(account.get('read_ids', []))
     ))
-    conn.commit()
-    conn.close()
 
 def delete_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
-
-def update_messages(user_id, messages, read_ids):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE users SET messages = ?, read_ids = ? WHERE user_id = ?
-    ''', (json.dumps(messages), json.dumps(read_ids), user_id))
-    conn.commit()
-    conn.close()
+    if not client:
+        return
+    
+    client.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
 
 def get_all_users():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM users')
-    rows = cursor.fetchall()
-    conn.close()
-    return [row[0] for row in rows]
+    if not client:
+        return []
+    
+    result = client.execute('SELECT user_id FROM users')
+    return [row[0] for row in result.fetchall()]
 
 # ===== ХРАНИЛИЩЕ (кэш в памяти) =====
-user_accounts_cache = {}  # {user_id: account_dict}
-bot_messages = {}  # {user_id: message_id}
+user_accounts_cache = {}
+bot_messages = {}
 
 def load_all_users_to_cache():
-    """Загружает всех пользователей из БД в память при старте"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id, email, token, account_id, messages, read_ids FROM users')
-    rows = cursor.fetchall()
-    conn.close()
+    if not client:
+        return
+    
+    result = client.execute('SELECT user_id, email, token, account_id, messages, read_ids FROM users')
+    rows = result.fetchall()
     
     for row in rows:
         user_id = row[0]
@@ -126,7 +122,7 @@ def load_all_users_to_cache():
         }
     
     if rows:
-        logger.info(f"✅ Loaded {len(rows)} users from database")
+        logger.info(f"✅ Loaded {len(rows)} users from Turso")
 
 # ===== MAILCAT API =====
 MAILCAT_API = "https://api.mailcat.ai"
@@ -305,7 +301,6 @@ async def send_bot_message(user_id, text, reply_markup=None):
         return None
 
 async def show_main_screen(user_id):
-    # Пытаемся получить из кэша, если нет — из БД
     account = user_accounts_cache.get(str(user_id))
     if not account:
         account = get_user(str(user_id))
@@ -395,7 +390,6 @@ async def check_handler(message: types.Message):
         new = await check_mailcat(account)
         if new:
             account.setdefault('messages', []).extend(new)
-            # Сохраняем в БД
             save_user(user_id, account)
         
         messages = account.get('messages', [])
@@ -540,10 +534,7 @@ async def background_check():
         await asyncio.sleep(30)
 
 async def main():
-    # Инициализация БД
     init_db()
-    
-    # Загружаем всех пользователей в кэш
     load_all_users_to_cache()
     
     await start_web()
