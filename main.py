@@ -144,7 +144,6 @@ def extract_links(text):
 
 # ===== БАЗА ДАННЫХ =====
 def extract_value(data):
-    """Извлекает значение из Turso-формата {'type': 'text', 'value': '...'}"""
     if isinstance(data, dict) and 'value' in data:
         return data['value']
     return data
@@ -188,8 +187,9 @@ async def get_user(user_id):
     rows = result.get('result', {}).get('rows', [])
     if rows:
         row = rows[0]
+        user_data = {}
         if isinstance(row, (list, tuple)):
-            return {
+            user_data = {
                 'email': str(extract_value(row[0])) if row[0] else '',
                 'token': str(extract_value(row[1])) if row[1] else '',
                 'account_id': str(extract_value(row[2])) if row[2] else '',
@@ -197,13 +197,17 @@ async def get_user(user_id):
                 'read_ids': json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
             }
         elif isinstance(row, dict):
-            return {
+            user_data = {
                 'email': str(extract_value(row.get('email', ''))),
                 'token': str(extract_value(row.get('token', ''))),
                 'account_id': str(extract_value(row.get('account_id', ''))),
                 'messages': deserialize_messages(row.get('messages', [])),
                 'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
             }
+        # Принудительная нормализация
+        if not isinstance(user_data.get('messages'), list):
+            user_data['messages'] = []
+        return user_data
     return None
 
 async def save_user(user_id, account):
@@ -260,30 +264,33 @@ async def load_all_users_to_cache():
         if isinstance(row, (list, tuple)):
             if len(row) >= 6:
                 user_id = str(extract_value(row[0]))
+                messages = deserialize_messages(row[4])
+                if not isinstance(messages, list):
+                    messages = []
                 user_accounts_cache[user_id] = {
                     'email': str(extract_value(row[1])) if row[1] else '',
                     'token': str(extract_value(row[2])) if row[2] else '',
                     'account_id': str(extract_value(row[3])) if row[3] else '',
-                    'messages': deserialize_messages(row[4]),
+                    'messages': messages,
                     'read_ids': json.loads(row[5]) if isinstance(row[5], str) else (row[5] or [])
                 }
         elif isinstance(row, dict):
             user_id = str(extract_value(row.get('user_id', '')))
+            messages = deserialize_messages(row.get('messages', []))
+            if not isinstance(messages, list):
+                messages = []
             user_accounts_cache[user_id] = {
                 'email': str(extract_value(row.get('email', ''))),
                 'token': str(extract_value(row.get('token', ''))),
                 'account_id': str(extract_value(row.get('account_id', ''))),
-                'messages': deserialize_messages(row.get('messages', [])),
+                'messages': messages,
                 'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
             }
-        else:
-            logger.warning(f"Unknown row format: {type(row)} - {row}")
-            continue
     
-    # Принудительная нормализация для всех пользователей
-    for user_id in user_accounts_cache:
-        if not isinstance(user_accounts_cache[user_id].get('messages'), list):
-            user_accounts_cache[user_id]['messages'] = []
+    # Дополнительная нормализация для всех пользователей
+    for uid in user_accounts_cache:
+        if not isinstance(user_accounts_cache[uid].get('messages'), list):
+            user_accounts_cache[uid]['messages'] = []
     
     if rows:
         logger.info(f"✅ Loaded {len(rows)} users from Turso")
@@ -312,10 +319,8 @@ async def create_mailcat_mailbox():
             }
 
 async def check_mailcat(account):
-    # ПРИНУДИТЕЛЬНО превращаем messages в список
-    if 'messages' not in account:
-        account['messages'] = []
-    elif not isinstance(account['messages'], list):
+    # Принудительная нормализация
+    if 'messages' not in account or not isinstance(account['messages'], list):
         account['messages'] = []
     
     async with aiohttp.ClientSession() as session:
@@ -445,7 +450,7 @@ async def show_main_screen(user_id):
         return
     
     # Нормализуем messages в список
-    if 'messages' not in account or not isinstance(account['messages'], list):
+    if not isinstance(account.get('messages'), list):
         account['messages'] = []
     
     valid_messages = [m for m in account['messages'] if isinstance(m, dict)]
@@ -467,16 +472,11 @@ async def show_main_screen(user_id):
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     user_id = str(message.from_user.id)
-    
-    # Проверяем, есть ли ящик в БД
     account = user_accounts_cache.get(user_id) or await get_user(user_id)
-    
     if account:
-        # Если есть ящик — показываем главный экран
         user_accounts_cache[user_id] = account
         await show_main_screen(user_id)
     else:
-        # Если нет — показываем приветствие
         await send_bot_message(
             user_id,
             "👋 **Добро пожаловать!**\n\n"
@@ -488,16 +488,13 @@ async def start(message: types.Message):
 @dp.message_handler(lambda message: message.text == "📧 Создать почту")
 async def create_handler(message: types.Message):
     user_id = str(message.from_user.id)
-    
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
-    
     if user_id in user_accounts_cache:
         await show_main_screen(user_id)
         return
-    
     try:
         account = await create_mailcat_mailbox()
         user_accounts_cache[user_id] = account
@@ -514,31 +511,23 @@ async def create_handler(message: types.Message):
 @dp.message_handler(lambda message: message.text == "📨 Проверить почту")
 async def check_handler(message: types.Message):
     user_id = str(message.from_user.id)
-    
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
-    
     account = user_accounts_cache.get(user_id) or await get_user(user_id)
     if not account:
         await show_main_screen(user_id)
         return
-    
-    # Нормализуем messages в список
-    if 'messages' not in account or not isinstance(account['messages'], list):
+    if not isinstance(account.get('messages'), list):
         account['messages'] = []
-    
     await send_bot_message(user_id, "🔄 **Проверяю почту...**", None)
-    
     try:
         new = await check_mailcat(account)
-        if new:
+        if new and isinstance(account['messages'], list):
             account['messages'].extend(new)
             await save_user(user_id, account)
-        
         valid_messages = [m for m in account['messages'] if isinstance(m, dict)]
-        
         if not valid_messages:
             await send_bot_message(
                 user_id,
@@ -546,7 +535,6 @@ async def check_handler(message: types.Message):
                 back_keyboard()
             )
             return
-        
         text = f"📩 **Письма ({len(valid_messages)}):**\n\n"
         for i, msg in enumerate(valid_messages[-10:][::-1], 1):
             time = datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M')
@@ -562,14 +550,10 @@ async def check_handler(message: types.Message):
                     link_preview = str(link)[:80] + "..."
                 text += f"   🔗 {link_preview}\n"
             text += "\n"
-        
         if len(valid_messages) > 10:
             text += f"... и еще {len(valid_messages)-10} писем\n"
-        
         text += f"\n📌 **Всего:** {len(valid_messages)}"
-        
         await send_bot_message(user_id, text, back_keyboard())
-        
     except Exception as e:
         logger.error(f"Check error: {e}")
         await send_bot_message(
@@ -581,17 +565,14 @@ async def check_handler(message: types.Message):
 @dp.message_handler(lambda message: message.text == "🗑 Удалить ящик")
 async def delete_handler(message: types.Message):
     user_id = str(message.from_user.id)
-    
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
-    
     account = user_accounts_cache.get(user_id) or await get_user(user_id)
     if not account:
         await show_main_screen(user_id)
         return
-    
     await send_bot_message(
         user_id,
         f"⚠️ **Вы уверены, что хотите удалить ящик?**\n\n"
@@ -603,27 +584,22 @@ async def delete_handler(message: types.Message):
 @dp.message_handler(lambda message: message.text == "✅ Да, удалить")
 async def confirm_delete_handler(message: types.Message):
     user_id = str(message.from_user.id)
-    
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
-    
     account = user_accounts_cache.get(user_id) or await get_user(user_id)
     if not account:
         await show_main_screen(user_id)
         return
-    
     try:
         async with aiohttp.ClientSession() as session:
             headers = {"Authorization": f"Bearer {account['token']}"}
             await session.delete(f"{MAILCAT_API}/mailboxes", headers=headers)
     except:
         pass
-    
     user_accounts_cache.pop(user_id, None)
     await delete_user(user_id)
-    
     await send_bot_message(
         user_id,
         "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости",
@@ -667,9 +643,11 @@ async def background_check():
                 try:
                     account = user_accounts_cache.get(user_id) or await get_user(user_id)
                     if account:
-                        # ПРИНУДИТЕЛЬНО превращаем messages в список
-                        if 'messages' not in account or not isinstance(account['messages'], list):
+                        # ПРИНУДИТЕЛЬНАЯ нормализация с перезаписью в БД
+                        if not isinstance(account.get('messages'), list):
                             account['messages'] = []
+                            await save_user(user_id, account)
+                            logger.info(f"🔧 Fixed messages format for user {user_id}")
                         
                         new = await check_mailcat(account)
                         if new and isinstance(account['messages'], list):
@@ -700,20 +678,15 @@ async def main():
     try:
         await init_db()
         logger.info("✅ Database initialized")
-        
         await load_all_users_to_cache()
-        
         await start_web()
         asyncio.create_task(background_check())
-        
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("✅ Webhook deleted")
         except:
             pass
-        
         logger.info("🚀 Bot started")
-        
         while True:
             try:
                 await dp.start_polling(bot)
