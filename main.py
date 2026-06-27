@@ -101,6 +101,28 @@ def decode_header_value(value):
     except:
         return value
 
+def decode_quoted_printable(text):
+    """Правильно декодирует quoted-printable с русскими буквами"""
+    if not text:
+        return ''
+    try:
+        # Убираем экранирование
+        text = text.replace('\\-', '-').replace('\\.', '.').replace('\\=', '=')
+        # Декодируем quoted-printable
+        decoded = quopri.decodestring(text.encode('utf-8'))
+        # Пробуем UTF-8
+        try:
+            return decoded.decode('utf-8', errors='ignore')
+        except:
+            # Пробуем Windows-1251
+            try:
+                return decoded.decode('windows-1251', errors='ignore')
+            except:
+                return decoded.decode('utf-8', errors='ignore')
+    except Exception as e:
+        logger.error(f"Decode error: {e}")
+        return text
+
 def extract_links_from_text(text):
     if not text:
         return []
@@ -114,7 +136,6 @@ def extract_links_from_text(text):
     return clean
 
 def clean_html_fallback(html):
-    """Запасной метод очистки HTML без BeautifulSoup"""
     if not html:
         return ''
     html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
@@ -337,12 +358,15 @@ async def check_mailcat(account):
                         raw_from = email_data.get('email', {}).get('from', 'unknown')
                         sender = decode_header_value(raw_from)
                         
-                        # Берём текстовую версию (уже декодирована mailcat'ом)
+                        # Пробуем текстовую версию
                         clean_text = email_data.get('email', {}).get('text', '')
-                        # Если нет текстовой — чистим HTML
+                        # Если нет — чистим HTML
                         if not clean_text:
                             html = email_data.get('email', {}).get('html', '')
                             clean_text = clean_html_fallback(html)
+                        
+                        # Декодируем quoted-printable
+                        clean_text = decode_quoted_printable(clean_text)
                         
                         # Извлекаем ссылки
                         all_links = extract_links_from_text(clean_text)
@@ -513,6 +537,7 @@ async def show_body_callback(callback: types.CallbackQuery):
         return
     msg = valid_messages[-idx]
     body = msg.get('body', 'Нет текста')
+    body = decode_quoted_printable(body)  # Декодируем перед показом
     body = escape_markdown(body)
     text = f"📄 **Полный текст письма**\n\n"
     text += f"📌 **От:** {msg.get('sender', 'unknown')}\n"
@@ -707,7 +732,6 @@ async def main():
         await start_web()
         asyncio.create_task(background_check())
         
-        # Принудительное удаление webhook
         for attempt in range(5):
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
