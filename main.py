@@ -3,12 +3,13 @@ import logging
 import secrets
 import string
 import aiohttp
+import hashlib
 from datetime import datetime
 from collections import defaultdict
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from dotenv import load_dotenv
 import os
 
@@ -19,99 +20,131 @@ logger = logging.getLogger(__name__)
 # ===== КОНФИГ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
-DOMAIN = "mail.tm"  # Используем mail.tm
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "https://your-service.onrender.com")
 
 # ===== ХРАНИЛИЩЕ =====
-user_accounts = {}  # {user_id: {email, password, token, messages: []}}
+user_accounts = {}  # {user_id: {email, sid, messages: []}}
 user_messages = {}
+last_check = {}
 
-# ===== MAIL.TM API =====
-MAIL_API = "https://api.mail.tm"
+# ===== GUERRILLA MAIL API =====
+# Документация: https://www.guerrillamail.com/apidocs
+GM_API = "https://api.guerrillamail.com/ajax.php"
 
-async def create_mail_account():
-    """Создает временный email через mail.tm"""
+async def create_guerrilla_email():
+    """Создает email через Guerrilla Mail"""
     async with aiohttp.ClientSession() as session:
-        # Генерируем случайный адрес
-        local = ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-        email = f"{local}@{DOMAIN}"
-        password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+        # Генерируем email
+        local = ''.join(secrets.choice(string.ascii_lowercase) for _ in range(8))
+        email = f"{local}@guerrillamail.com"
         
-        # Регистрируем аккаунт
-        async with session.post(f"{MAIL_API}/accounts", json={
-            "address": email,
-            "password": password
-        }) as resp:
-            if resp.status != 201:
-                raise Exception("Failed to create account")
-            data = await resp.json()
-            account_id = data.get('id')
-        
-        # Получаем токен
-        async with session.post(f"{MAIL_API}/token", json={
-            "address": email,
-            "password": password
-        }) as resp:
-            if resp.status != 200:
-                raise Exception("Failed to get token")
-            data = await resp.json()
-            token = data.get('token')
-        
-        return {
-            'email': email,
-            'password': password,
-            'token': token,
-            'account_id': account_id,
-            'messages': []
+        # Получаем sid
+        params = {
+            'f': 'get_email_address',
+            'ip': '127.0.0.1',
+            'agent': 'bot',
+            'email_user': local
         }
-
-async def check_mail(account):
-    """Проверяет новые письма"""
-    async with aiohttp.ClientSession() as session:
-        headers = {"Authorization": f"Bearer {account['token']}"}
         
-        # Получаем список писем
-        async with session.get(f"{MAIL_API}/messages", headers=headers) as resp:
+        async with session.get(GM_API, params=params) as resp:
+            if resp.status != 200:
+                raise Exception("Failed to create email")
+            data = await resp.json()
+            
+            sid = data.get('sid')
+            email = data.get('email_addr')
+            
+            if not sid or not email:
+                raise Exception("Invalid response")
+            
+            return {
+                'email': email,
+                'sid': sid,
+                'messages': [],
+                'ids': []
+            }
+
+async def check_guerrilla_mail(account):
+    """Проверяет новые письма через Guerrilla Mail"""
+    async with aiohttp.ClientSession() as session:
+        params = {
+            'f': 'fetch_email',
+            'sid': account['sid'],
+            'seq': 0
+        }
+        
+        async with session.get(GM_API, params=params) as resp:
             if resp.status != 200:
                 return []
+            
             data = await resp.json()
-            messages = data.get('hydra:member', [])
-        
-        new_messages = []
-        for msg in messages:
-            msg_id = msg.get('id')
-            # Проверяем, не читали ли уже
-            if msg_id not in account.get('read_ids', []):
-                # Получаем полное письмо
-                async with session.get(f"{MAIL_API}/messages/{msg_id}", headers=headers) as resp2:
-                    if resp2.status == 200:
-                        full = await resp2.json()
-                        account.setdefault('read_ids', []).append(msg_id)
-                        new_messages.append({
-                            'sender': full.get('from', {}).get('address', 'unknown'),
-                            'subject': full.get('subject', '(no subject)'),
-                            'body': full.get('text', '') or full.get('html', ''),
-                            'received_at': datetime.fromisoformat(full.get('createdAt', datetime.now().isoformat()).replace('Z', '+00:00'))
-                        })
-        
-        return new_messages
+            emails = data.get('list', [])
+            
+            new_messages = []
+            for email_data in emails:
+                mail_id = email_data.get('mail_id')
+                if mail_id not in account.get('ids', []):
+                    account.setdefault('ids', []).append(mail_id)
+                    
+                    # Получаем полное письмо
+                    params2 = {
+                        'f': 'fetch_email',
+                        'sid': account['sid'],
+                        'email_id': mail_id
+                    }
+                    
+                    async with session.get(GM_API, params=params2) as resp2:
+                        if resp2.status == 200:
+                            full = await resp2.json()
+                            
+                            # Декодируем body (base64)
+                            import base64
+                            body_raw = full.get('mail_body', '')
+                            try:
+                                body = base64.b64decode(body_raw).decode('utf-8', errors='ignore')
+                            except:
+                                body = body_raw
+                            
+                            new_messages.append({
+                                'sender': full.get('mail_from', 'unknown'),
+                                'subject': full.get('mail_subject', '(no subject)'),
+                                'body': body[:5000],
+                                'received_at': datetime.fromtimestamp(int(full.get('mail_timestamp', 0)))
+                            })
+            
+            return new_messages
 
 # ===== WEB СЕРВЕР =====
+async def webhook(request):
+    if request.headers.get('content-type') == 'application/json':
+        data = await request.json()
+        try:
+            await dp.process_update(data)
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+        return web.Response(text="OK")
+    return web.Response(text="Bad Request", status=400)
+
 async def health_check(request):
-    return web.Response(text="OK", status=200)
+    return web.Response(text="OK")
 
 async def start_web():
     app = web.Application()
+    app.router.add_post(f'/{BOT_TOKEN}', webhook)
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
+    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"✅ Web server running on port {PORT}")
+    logger.info(f"✅ Web server on port {PORT}")
+    return app
 
 # ===== TELEGRAM БОТ =====
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
 
 def get_main_menu():
     keyboard = InlineKeyboardMarkup(row_width=2)
@@ -130,28 +163,19 @@ async def safe_edit(user_id, text, reply_markup=None):
         try:
             sent = await bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=reply_markup)
             user_messages[user_id] = sent.message_id
-            return
-        except Exception as e:
-            logger.error(f"Send error: {e}")
-            return
+        except:
+            pass
+        return
     
     try:
-        await bot.edit_message_text(
-            text,
-            chat_id=user_id,
-            message_id=msg_id,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    except Exception as e:
-        if "message can't be edited" in str(e).lower() or "message to edit not found" in str(e).lower():
-            try:
-                sent = await bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=reply_markup)
-                user_messages[user_id] = sent.message_id
-            except Exception as e2:
-                logger.error(f"Send error: {e2}")
+        await bot.edit_message_text(text, chat_id=user_id, message_id=msg_id, parse_mode='Markdown', reply_markup=reply_markup)
+    except:
+        try:
+            sent = await bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=reply_markup)
+            user_messages[user_id] = sent.message_id
+        except:
+            pass
 
-# ===== ОБРАБОТЧИКИ =====
 @dp.message_handler(commands=['start', 'menu'])
 async def start(message: types.Message):
     user_id = message.from_user.id
@@ -160,9 +184,9 @@ async def start(message: types.Message):
     await safe_edit(
         user_id,
         "📧 **Временная почта**\n\n"
-        "Создавайте email и получайте письма в Telegram\n"
-        "🌐 Используется mail.tm\n\n"
-        "⚠️ Письма приходят с задержкой до 30 секунд",
+        "Создавайте email и получайте письма\n"
+        "🌐 Используется Guerrilla Mail\n\n"
+        "⏳ Письма приходят с задержкой до 30 сек",
         get_main_menu()
     )
 
@@ -170,7 +194,7 @@ async def start(message: types.Message):
 async def any_message(message: types.Message):
     user_id = message.from_user.id
     user_messages[user_id] = message.message_id
-    await safe_edit(user_id, "📧 Используйте кнопки ниже:", get_main_menu())
+    await safe_edit(user_id, "📧 Используйте кнопки:", get_main_menu())
 
 @dp.callback_query_handler(lambda c: True)
 async def handle_callbacks(callback: types.CallbackQuery):
@@ -181,29 +205,30 @@ async def handle_callbacks(callback: types.CallbackQuery):
     
     if data == "create":
         if str(user_id) in user_accounts:
-            await safe_edit(user_id, "❌ **У вас уже есть ящик**\n\nУдалите старый перед созданием нового", get_main_menu())
+            await safe_edit(user_id, "❌ **У вас уже есть ящик**\n\nУдалите старый", get_main_menu())
             return
         
         try:
-            account = await create_mail_account()
+            account = await create_guerrilla_email()
             user_accounts[str(user_id)] = account
+            last_check[str(user_id)] = datetime.now()
             
             await safe_edit(
                 user_id,
                 f"✅ **Создан email:**\n`{account['email']}`\n\n"
-                f"📩 Отправляйте письма на этот адрес\n"
-                f"🔄 Нажмите «Проверить почту» для получения писем\n"
-                f"⏳ Письма приходят с задержкой до 30 секунд",
+                f"📩 Используйте этот адрес для регистрации\n"
+                f"🔄 Нажмите «Проверить почту»\n"
+                f"⏳ Письма приходят с задержкой до 30 сек",
                 get_main_menu()
             )
         except Exception as e:
             logger.error(f"Create error: {e}")
-            await safe_edit(user_id, "❌ **Ошибка создания**\nПопробуйте позже", get_main_menu())
+            await safe_edit(user_id, "❌ **Ошибка создания**\nПопробуйте через минуту", get_main_menu())
     
     elif data == "list":
         account = user_accounts.get(str(user_id))
         if not account:
-            await safe_edit(user_id, "📭 **У вас нет ящика**\n\nНажмите «Создать почту»", get_main_menu())
+            await safe_edit(user_id, "📭 **Нет ящика**", get_main_menu())
             return
         
         msg_count = len(account.get('messages', []))
@@ -216,24 +241,25 @@ async def handle_callbacks(callback: types.CallbackQuery):
     elif data == "check":
         account = user_accounts.get(str(user_id))
         if not account:
-            await safe_edit(user_id, "📭 **Нет ящика**\n\nНажмите «Создать почту»", get_main_menu())
+            await safe_edit(user_id, "📭 **Нет ящика**", get_main_menu())
             return
         
-        await safe_edit(user_id, "🔄 **Проверяю почту...**", get_main_menu())
+        await safe_edit(user_id, "🔄 **Проверяю...**", get_main_menu())
         
         try:
-            new_messages = await check_mail(account)
+            new_messages = await check_guerrilla_mail(account)
             if new_messages:
                 account.setdefault('messages', []).extend(new_messages)
                 await safe_edit(
                     user_id,
-                    f"✅ **Получено {len(new_messages)} новых писем!**\n\nНажмите ещё раз для просмотра",
+                    f"✅ **Получено {len(new_messages)} писем!**\n\nНажмите ещё раз для просмотра",
                     get_main_menu()
                 )
             else:
+                total = len(account.get('messages', []))
                 await safe_edit(
                     user_id,
-                    f"📭 **Новых писем нет**\n\nВсего писем: {len(account.get('messages', []))}",
+                    f"📭 **Новых писем нет**\n\nВсего: {total}",
                     get_main_menu()
                 )
         except Exception as e:
@@ -277,79 +303,56 @@ async def handle_callbacks(callback: types.CallbackQuery):
     elif data == "delete":
         account = user_accounts.get(str(user_id))
         if not account:
-            await safe_edit(user_id, "📭 **Нет ящика для удаления**", get_main_menu())
+            await safe_edit(user_id, "📭 **Нет ящика**", get_main_menu())
             return
         
-        # Удаляем аккаунт на mail.tm
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"Authorization": f"Bearer {account['token']}"}
-                await session.delete(f"{MAIL_API}/accounts/{account['account_id']}", headers=headers)
-        except Exception as e:
-            logger.error(f"Delete error: {e}")
-        
         del user_accounts[str(user_id)]
-        await safe_edit(user_id, f"🗑 **Ящик удалён:**\n`{account['email']}`", get_main_menu())
+        await safe_edit(user_id, f"🗑 **Ящик удалён**", get_main_menu())
     
     elif data == "back_to_menu":
         await safe_edit(user_id, "📧 **Главное меню**", get_main_menu())
-    
-    else:
-        # Если нажали на письмо - показываем его
-        if data.startswith("msg_"):
-            # Можно реализовать просмотр конкретного письма
-            await safe_edit(user_id, "📖 Функция в разработке", get_main_menu())
 
-# ===== ФОНОВАЯ ПРОВЕРКА ПОЧТЫ =====
+# ===== ФОНОВАЯ ПРОВЕРКА =====
 async def background_check():
-    """Проверяет почту каждые 30 секунд для всех пользователей"""
     while True:
         try:
             for user_id, account in list(user_accounts.items()):
-                if account:
-                    try:
-                        new_messages = await check_mail(account)
-                        if new_messages:
-                            account.setdefault('messages', []).extend(new_messages)
-                            # Уведомляем пользователя
-                            try:
-                                await bot.send_message(
-                                    int(user_id),
-                                    f"📨 **Новое письмо!**\n\n"
-                                    f"От: {new_messages[0]['sender']}\n"
-                                    f"Тема: {new_messages[0]['subject']}\n\n"
-                                    f"Нажмите «Проверить почту» для просмотра",
-                                    parse_mode='Markdown'
-                                )
-                            except:
-                                pass
-                    except:
-                        pass
+                try:
+                    new_messages = await check_guerrilla_mail(account)
+                    if new_messages:
+                        account.setdefault('messages', []).extend(new_messages)
+                        await bot.send_message(
+                            int(user_id),
+                            f"📨 **Новое письмо!**\n\n"
+                            f"От: {new_messages[0]['sender']}\n"
+                            f"Тема: {new_messages[0]['subject']}\n\n"
+                            f"Нажмите «Проверить почту»",
+                            parse_mode='Markdown'
+                        )
+                except:
+                    pass
         except:
             pass
         await asyncio.sleep(30)
 
-async def start_bot_with_retry():
-    while True:
-        try:
-            logger.info("🚀 Starting bot...")
-            await dp.start_polling(bot)
-            break
-        except TerminatedByOtherGetUpdates:
-            logger.warning("⚠️ Conflict detected, waiting 5 seconds...")
-            await asyncio.sleep(5)
-        except Exception as e:
-            logger.error(f"Bot error: {e}")
-            await asyncio.sleep(5)
+# ===== ЗАПУСК =====
+async def set_webhook():
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        await bot.set_webhook(webhook_url)
+        logger.info(f"✅ Webhook set to {webhook_url}")
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
 
 async def main():
     await start_web()
-    
-    # Запускаем фоновую проверку
+    await set_webhook()
     asyncio.create_task(background_check())
-    logger.info("🔄 Background mail checker started")
+    logger.info("🔄 Mail checker started")
     
-    await start_bot_with_retry()
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
