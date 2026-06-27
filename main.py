@@ -10,7 +10,6 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.utils.executor import start_webhook
 from dotenv import load_dotenv
 import os
 
@@ -21,11 +20,11 @@ logger = logging.getLogger(__name__)
 # ===== КОНФИГ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "https://emailer-lxu5.onrender.com")
+DOMAIN = "guerrillamail.com"
 
 # ===== ХРАНИЛИЩЕ =====
-user_accounts = {}
-user_messages = {}
+user_accounts = {}  # {user_id: {email, sid, messages: [], ids: []}}
+user_messages = {}  # {user_id: message_id}
 
 # ===== GUERRILLA MAIL API =====
 GM_API = "https://api.guerrillamail.com/ajax.php"
@@ -105,7 +104,7 @@ async def check_guerrilla_mail(account):
             
             return new_messages
 
-# ===== WEB СЕРВЕР (для health check) =====
+# ===== WEB СЕРВЕР =====
 async def health_check(request):
     return web.Response(text="OK", status=200)
 
@@ -126,9 +125,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-# Устанавливаем бота в контекст
-Bot.set_current(bot)
-
 def get_main_menu():
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -140,28 +136,45 @@ def get_main_menu():
     return keyboard
 
 async def safe_edit(user_id, text, reply_markup=None):
+    """Редактирует одно сообщение, никогда не дублирует"""
     msg_id = user_messages.get(user_id)
     
-    if not msg_id:
+    # Пробуем отредактировать существующее сообщение
+    if msg_id:
         try:
-            sent = await bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=reply_markup)
-            user_messages[user_id] = sent.message_id
-        except:
-            pass
-        return
+            await bot.edit_message_text(
+                text,
+                chat_id=user_id,
+                message_id=msg_id,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+            return
+        except Exception as e:
+            # Если сообщение не найдено или не может быть отредактировано
+            if "message to edit not found" in str(e).lower() or "message can't be edited" in str(e).lower():
+                # Удаляем старый ID, отправим новое
+                user_messages.pop(user_id, None)
+            else:
+                # Другие ошибки логируем, но не останавливаемся
+                logger.error(f"Edit error: {e}")
     
+    # Если нет сообщения или не удалось отредактировать - отправляем новое
     try:
-        await bot.edit_message_text(text, chat_id=user_id, message_id=msg_id, parse_mode='Markdown', reply_markup=reply_markup)
-    except:
-        try:
-            sent = await bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=reply_markup)
-            user_messages[user_id] = sent.message_id
-        except:
-            pass
+        sent = await bot.send_message(
+            user_id,
+            text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+        user_messages[user_id] = sent.message_id
+    except Exception as e:
+        logger.error(f"Send error: {e}")
 
 @dp.message_handler(commands=['start', 'menu'])
 async def start(message: types.Message):
     user_id = message.from_user.id
+    # Сохраняем ID первого сообщения
     user_messages[user_id] = message.message_id
     
     await safe_edit(
@@ -233,7 +246,7 @@ async def handle_callbacks(callback: types.CallbackQuery):
                 account.setdefault('messages', []).extend(new_messages)
                 await safe_edit(
                     user_id,
-                    f"✅ **Получено {len(new_messages)} писем!**",
+                    f"✅ **Получено {len(new_messages)} писем!**\n\nНажмите ещё раз для просмотра",
                     get_main_menu()
                 )
             else:
@@ -287,11 +300,22 @@ async def handle_callbacks(callback: types.CallbackQuery):
             await safe_edit(user_id, "📭 **Нет ящика**", get_main_menu())
             return
         
+        # Удаляем ящик на сервере
+        try:
+            async with aiohttp.ClientSession() as session:
+                params = {
+                    'f': 'forget_me',
+                    'sid': account['sid']
+                }
+                await session.get(GM_API, params=params)
+        except:
+            pass
+        
         del user_accounts[str(user_id)]
         await safe_edit(user_id, f"🗑 **Ящик удалён**", get_main_menu())
     
     elif data == "back_to_menu":
-        await safe_edit(user_id, "📧 **Главное меню**", get_main_menu())
+        await safe_edit(user_id, "📧 **Главное меню**\n\nВыберите действие:", get_main_menu())
 
 # ===== ФОНОВАЯ ПРОВЕРКА =====
 async def background_check():
@@ -302,11 +326,13 @@ async def background_check():
                     new_messages = await check_guerrilla_mail(account)
                     if new_messages:
                         account.setdefault('messages', []).extend(new_messages)
+                        # Отправляем уведомление в новом сообщении
                         await bot.send_message(
                             int(user_id),
                             f"📨 **Новое письмо!**\n\n"
                             f"От: {new_messages[0]['sender']}\n"
-                            f"Тема: {new_messages[0]['subject']}",
+                            f"Тема: {new_messages[0]['subject']}\n\n"
+                            f"Нажмите «Проверить почту»",
                             parse_mode='Markdown'
                         )
                 except:
@@ -315,28 +341,27 @@ async def background_check():
             pass
         await asyncio.sleep(30)
 
-# ===== ЗАПУСК (POLLING - БЕЗ WEBHOOK) =====
+# ===== ЗАПУСК =====
 async def main():
-    # Запускаем web сервер для health check
+    # Запускаем web сервер
     await start_web()
     
     # Запускаем фоновую проверку
     asyncio.create_task(background_check())
     logger.info("🔄 Mail checker started")
     
-    # Запускаем бота в режиме polling (без webhook)
+    # Запускаем бота в режиме polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Webhook deleted, using polling")
+        logger.info("✅ Webhook deleted")
         
-        # Запускаем polling с обработкой конфликтов
         while True:
             try:
                 await dp.start_polling(bot)
                 break
             except Exception as e:
                 if "Conflict" in str(e):
-                    logger.warning("⚠️ Conflict detected, waiting 5 seconds...")
+                    logger.warning("⚠️ Conflict, waiting 5 sec...")
                     await asyncio.sleep(5)
                 else:
                     logger.error(f"Polling error: {e}")
