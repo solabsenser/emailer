@@ -32,12 +32,10 @@ if TURSO_URL.startswith("libsql://"):
     TURSO_URL = TURSO_URL.replace("libsql://", "https://")
     logger.info(f"✅ Converted to HTTPS: {TURSO_URL}")
 
-# Добавляем порт если нет
-if ":443" not in TURSO_URL and ":8080" not in TURSO_URL:
-    TURSO_URL = TURSO_URL.replace("https://", "https://")
-    TURSO_URL = TURSO_URL.rstrip("/") + ":443"
+# Убираем порт если есть
+TURSO_URL = TURSO_URL.replace(":443", "").rstrip("/")
 
-# ===== TURSO HTTP API =====
+# ===== TURSO HTTP API (правильный формат) =====
 class TursoClient:
     def __init__(self, url, token):
         self.url = url
@@ -50,21 +48,27 @@ class TursoClient:
                 "Authorization": f"Bearer {self.token}",
                 "Content-Type": "application/json"
             }
+            
+            # Правильный формат для Turso — поле "stmt"
             payload = {
-                "statements": [{"sql": sql, "args": params or []}]
+                "stmt": {
+                    "sql": sql,
+                    "args": params or []
+                }
             }
             
-            # Правильный URL для Turso API
-            base_url = self.url.replace(":443", "")
-            full_url = f"{base_url.rstrip('/')}/v1/execute"
+            full_url = f"{self.url}/v1/execute"
             
-            logger.debug(f"Executing: {sql[:50]}...")
-            
-            async with session.post(full_url, headers=headers, json=payload, ssl=True) as resp:
+            async with session.post(full_url, headers=headers, json=payload) as resp:
                 if resp.status != 200:
                     error = await resp.text()
                     raise Exception(f"Turso error {resp.status}: {error}")
                 data = await resp.json()
+                
+                # Проверяем наличие ошибок в ответе
+                if data.get("error"):
+                    raise Exception(f"Turso error: {data['error']}")
+                
                 return data
 
 turso = TursoClient(TURSO_URL, TURSO_TOKEN)
