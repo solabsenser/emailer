@@ -9,7 +9,7 @@ import json
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 import os
 
@@ -503,6 +503,57 @@ async def create_handler(message: types.Message):
             main_keyboard_no_account()
         )
 
+# ===== НОВЫЙ ОБРАБОТЧИК ДЛЯ ПРОСМОТРА ТЕКСТА ПИСЬМА =====
+@dp.callback_query_handler(lambda c: c.data.startswith("show_body_"))
+async def show_body_callback(callback: types.CallbackQuery):
+    user_id = str(callback.from_user.id)
+    # Извлекаем номер письма из callback_data
+    parts = callback.data.split('_')
+    if len(parts) < 3:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    
+    try:
+        idx = int(parts[2])
+    except:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    
+    account = user_accounts_cache.get(user_id) or await get_user(user_id)
+    if not account:
+        await callback.answer("❌ Аккаунт не найден", show_alert=True)
+        return
+    
+    valid_messages = [m for m in account.get('messages', []) if isinstance(m, dict)]
+    if idx < 1 or idx > len(valid_messages):
+        await callback.answer("❌ Письмо не найдено", show_alert=True)
+        return
+    
+    msg = valid_messages[-idx]  # Так как в списке они в обратном порядке
+    
+    # Формируем текст письма
+    text = f"📄 **Полный текст письма**\n\n"
+    text += f"📌 **От:** {msg.get('sender', 'unknown')}\n"
+    text += f"📌 **Тема:** {msg.get('subject', '(no subject)')}\n"
+    text += f"📌 **Время:** {datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M %d.%m.%Y')}\n\n"
+    text += f"📝 **Текст:**\n{msg.get('body', 'Нет текста')[:1000]}"
+    
+    if len(msg.get('body', '')) > 1000:
+        text += "\n\n... (текст обрезан, всего символов: {})".format(len(msg.get('body', '')))
+    
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("🔙 Назад к письмам", callback_data="back_to_messages"))
+    
+    await callback.message.edit_text(text, parse_mode='Markdown', reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_messages")
+async def back_to_messages_callback(callback: types.CallbackQuery):
+    user_id = str(callback.from_user.id)
+    await callback.answer()
+    # Возвращаемся к списку писем
+    await check_handler(callback.message)
+
 @dp.message_handler(lambda message: message.text == "📨 Проверить почту")
 async def check_handler(message: types.Message):
     user_id = str(message.from_user.id)
@@ -530,6 +581,7 @@ async def check_handler(message: types.Message):
                 back_keyboard()
             )
             return
+        
         text = f"📩 **Письма ({len(valid_messages)}):**\n\n"
         for i, msg in enumerate(valid_messages[-10:][::-1], 1):
             time = datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M')
@@ -544,10 +596,24 @@ async def check_handler(message: types.Message):
                 else:
                     text += f"   🔗 {str(link)}\n"
             text += "\n"
+        
         if len(valid_messages) > 10:
             text += f"... и еще {len(valid_messages)-10} писем\n"
         text += f"\n📌 **Всего:** {len(valid_messages)}"
-        await send_bot_message(user_id, text, back_keyboard())
+        
+        # Создаём клавиатуру с кнопками для просмотра текста
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        for idx, msg in enumerate(valid_messages[-10:][::-1], 1):
+            # Используем callback с номером письма
+            callback_data = f"show_body_{idx}"
+            keyboard.insert(InlineKeyboardButton(
+                f"📄 Письмо {idx}",
+                callback_data=callback_data
+            ))
+        keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_main"))
+        
+        await send_bot_message(user_id, text, keyboard)
+        
     except Exception as e:
         logger.error(f"Check error: {e}")
         await send_bot_message(
