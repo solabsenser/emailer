@@ -218,7 +218,7 @@ async def get_user(user_id):
                 'messages': ensure_list(row[3]),
                 'read_ids': ensure_list(row[4])
             }
-        elif isinstance(row, dict)):
+        elif isinstance(row, dict):
             user_data = {
                 'email': str(extract_value(row.get('email', ''))),
                 'token': str(extract_value(row.get('token', ''))),
