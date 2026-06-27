@@ -27,11 +27,28 @@ if not TURSO_URL or not TURSO_TOKEN:
     logger.error("❌ TURSO_URL or TURSO_TOKEN not set")
     exit(1)
 
+# Убеждаемся, что в URL есть порт
+if "://" in TURSO_URL:
+    # Если нет порта, добавляем :443 для HTTPS
+    if ":443" not in TURSO_URL and ":8080" not in TURSO_URL:
+        TURSO_URL = TURSO_URL.replace("https://", "https://")
+        if not TURSO_URL.endswith("/"):
+            TURSO_URL = TURSO_URL + "/"
+        # Turso использует порт 443 для HTTPS
+        logger.info(f"✅ Using Turso URL: {TURSO_URL}")
+
 # ===== TURSO HTTP API =====
 class TursoClient:
     def __init__(self, url, token):
         self.url = url
         self.token = token
+        # Парсим URL для получения хоста и порта
+        if url.startswith("https://"):
+            self.host = url.replace("https://", "").split("/")[0]
+            self.port = 443
+        else:
+            self.host = url.replace("http://", "").split("/")[0]
+            self.port = 80
     
     async def execute(self, sql, params=None):
         """Выполняет SQL через HTTP API"""
@@ -44,10 +61,16 @@ class TursoClient:
                 "statements": [{"sql": sql, "args": params or []}]
             }
             
-            async with session.post(self.url, headers=headers, json=payload) as resp:
+            # Используем полный URL с портом
+            full_url = self.url
+            if not full_url.endswith("/"):
+                full_url += "/"
+            full_url += "v1/execute"
+            
+            async with session.post(full_url, headers=headers, json=payload) as resp:
                 if resp.status != 200:
                     error = await resp.text()
-                    raise Exception(f"Turso error: {error}")
+                    raise Exception(f"Turso error {resp.status}: {error}")
                 data = await resp.json()
                 return data
 
@@ -542,33 +565,40 @@ async def background_check():
         await asyncio.sleep(30)
 
 async def main():
-    # Инициализация БД
-    await init_db()
-    
-    # Загружаем всех пользователей в кэш
-    await load_all_users_to_cache()
-    
-    await start_web()
-    asyncio.create_task(background_check())
-    
-    # Удаляем webhook
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Webhook deleted")
-    except:
-        pass
-    
-    while True:
+        # Инициализация БД
+        await init_db()
+        logger.info("✅ Database initialized")
+        
+        # Загружаем всех пользователей в кэш
+        await load_all_users_to_cache()
+        
+        await start_web()
+        asyncio.create_task(background_check())
+        
+        # Удаляем webhook
         try:
-            await dp.start_polling(bot)
-            break
-        except Exception as e:
-            if "ConflictError" in str(e) or "TerminatedByOtherGetUpdates" in str(e):
-                logger.warning("⚠️ Conflict detected, waiting 5 seconds...")
-                await asyncio.sleep(5)
-            else:
-                logger.error(f"Polling error: {e}")
-                await asyncio.sleep(5)
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Webhook deleted")
+        except:
+            pass
+        
+        logger.info("🚀 Bot started")
+        
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break
+            except Exception as e:
+                if "ConflictError" in str(e) or "TerminatedByOtherGetUpdates" in str(e):
+                    logger.warning("⚠️ Conflict detected, waiting 5 seconds...")
+                    await asyncio.sleep(5)
+                else:
+                    logger.error(f"Polling error: {e}")
+                    await asyncio.sleep(5)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main())
