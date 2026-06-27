@@ -102,21 +102,33 @@ def decode_header_value(value):
         return value
 
 def decode_quoted_printable(text):
-    """Декодирует quoted-printable и убирает экранирование"""
+    """Полностью декодирует quoted-printable и убирает все артефакты"""
     if not text:
         return ''
     try:
-        # Убираем экранирование обратных слэшей
-        text = text.replace('\\-', '-').replace('\\.', '.').replace('\\=', '=')
-        # Декодируем quoted-printable
+        # 1. Убираем экранирование обратных слэшей перед специальными символами
+        text = re.sub(r'\\([-.=])', r'\1', text)
+        
+        # 2. Декодируем quoted-printable
         decoded = quopri.decodestring(text.encode('utf-8'))
-        # Пробуем разные кодировки
+        
+        # 3. Пробуем разные кодировки
         for encoding in ['utf-8', 'windows-1251', 'koi8-r']:
             try:
                 result = decoded.decode(encoding, errors='ignore')
-                # Убираем оставшиеся '=' в конце строк (признак quoted-printable)
+                # 4. Убираем оставшиеся '=' в конце строк
                 result = re.sub(r'=\s*\n', ' ', result)
                 result = re.sub(r'=\s*$', ' ', result)
+                
+                # 5. Убираем все артефакты quoted-printable
+                result = re.sub(r'=([0-9A-F]{2})', lambda m: bytes.fromhex(m.group(1)).decode('utf-8', errors='ignore'), result, flags=re.IGNORECASE)
+                
+                # 6. Убираем мусорные последовательности
+                result = re.sub(r'=\\n', '', result)
+                result = re.sub(r'\\n', ' ', result)
+                result = re.sub(r'\\r', ' ', result)
+                result = re.sub(r'\s+', ' ', result)
+                
                 return result
             except:
                 continue
@@ -143,31 +155,47 @@ def clean_text_from_email(html):
     if not html:
         return ''
     
-    # Декодируем quoted-printable
+    # 1. Декодируем quoted-printable
     html = decode_quoted_printable(html)
     
-    # Убираем CSS блоки
+    # 2. Убираем CSS блоки
     html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
     
-    # Убираем все HTML теги
+    # 3. Убираем все HTML теги
     html = re.sub(r'<[^>]+>', ' ', html)
     
-    # Убираем CSS свойства
+    # 4. Убираем CSS свойства
     html = re.sub(r'\{[^}]*\}', '', html)
     
-    # Убираем множественные пробелы
+    # 5. Убираем множественные пробелы
     html = re.sub(r'\s+', ' ', html)
     
-    # Убираем мусорные последовательности (quoted-printable остатки)
+    # 6. Убираем мусорные последовательности
     html = re.sub(r'=20', ' ', html)
     html = re.sub(r'=3D', '=', html)
     html = re.sub(r'=2E', '.', html)
     html = re.sub(r'=2D', '-', html)
     html = re.sub(r'=09', ' ', html)
+    html = re.sub(r'=0A', '\n', html)
+    html = re.sub(r'=0D', '', html)
     
-    # Убираем Content-Type и другие заголовки
+    # 7. Убираем Content-Type и другие заголовки
     html = re.sub(r'Content-Type:[^\s]+', '', html, flags=re.IGNORECASE)
     html = re.sub(r'Content-Transfer-Encoding:[^\s]+', '', html, flags=re.IGNORECASE)
+    
+    # 8. Убираем оставшиеся экранированные символы
+    html = re.sub(r'\\([-.=])', r'\1', html)
+    
+    # 9. Убираем всё, что похоже на артефакты quoted-printable
+    html = re.sub(r'----=_mimepart_[a-f0-9]+', '', html)
+    html = re.sub(r'----[=_][a-zA-Z0-9]+', '', html)
+    
+    # 10. Убираем множественные пробелы и переносы
+    html = re.sub(r'\s+', ' ', html)
+    
+    # 11. Декодируем HTML-сущности
+    import html as html_parser
+    html = html_parser.unescape(html)
     
     return html.strip()
 
@@ -244,7 +272,7 @@ async def get_user(user_id):
                 'messages': deserialize_messages(row[3]),
                 'read_ids': json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
             }
-        elif isinstance(row, dict):
+        elif isinstance(row, dict)):
             user_data = {
                 'email': str(extract_value(row.get('email', ''))),
                 'token': str(extract_value(row.get('token', ''))),
