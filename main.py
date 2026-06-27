@@ -28,7 +28,6 @@ if not TURSO_URL or not TURSO_TOKEN:
     logger.error("❌ TURSO_URL or TURSO_TOKEN not set")
     exit(1)
 
-# Конвертируем libsql:// в https://
 if TURSO_URL.startswith("libsql://"):
     TURSO_URL = TURSO_URL.replace("libsql://", "https://")
     logger.info(f"✅ Converted to HTTPS: {TURSO_URL}")
@@ -64,13 +63,10 @@ class TursoClient:
                 "Authorization": f"Bearer {self.token}",
                 "Content-Type": "application/json"
             }
-            
             payload = {"stmt": {"sql": sql}}
             if params:
                 payload["stmt"]["args"] = self._format_params(params)
-            
             full_url = f"{self.url}/v1/execute"
-            
             try:
                 async with session.post(full_url, headers=headers, json=payload) as resp:
                     if resp.status != 200:
@@ -115,7 +111,6 @@ def decode_quoted_printable(text):
         return text
 
 def extract_links_from_html(html):
-    """Извлекает все ссылки из HTML"""
     if not html:
         return []
     hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', html, re.IGNORECASE)
@@ -126,37 +121,28 @@ def extract_links_from_html(html):
         link = link.strip('.,;:!?()[]{}"\'')
         if link.startswith('http') or link.startswith('www'):
             clean.append(link)
-    return clean[:5]
+    return clean
 
-def extract_code(text):
-    if not text:
+def clean_text_from_email(html):
+    if not html:
+        return ''
+    html = decode_quoted_printable(html)
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
+    html = re.sub(r'<[^>]+>', ' ', html)
+    html = re.sub(r'\{[^}]*\}', '', html)
+    html = re.sub(r'\s+', ' ', html)
+    return html.strip()
+
+def find_confirmation_link(links):
+    if not links:
         return None
-    patterns = [
-        r'\b(\d{4,8})\b',
-        r'код[:\s]*([A-Z0-9]{4,8})',
-        r'code[:\s]*([A-Z0-9]{4,8})',
-        r'verification code[:\s]*([A-Z0-9]{4,8})',
-        r'подтверждения[:\s]*([A-Z0-9]{4,8})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-        if match:
-            code = match.group(1) if match.groups() else match.group(0)
-            if len(code) >= 4:
-                return code
-    return None
-
-def extract_links(text):
-    if not text:
-        return []
-    url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
-    links = re.findall(url_pattern, text)
-    clean_links = []
     for link in links:
-        link = link.strip('.,;:!?()[]{}"\'')
-        if link.startswith('http') or link.startswith('www'):
-            clean_links.append(link)
-    return clean_links
+        if 'confirmemail' in link.lower() or 'verify' in link.lower() or 'confirmation' in link.lower():
+            return link
+    for link in links:
+        if '?' in link and len(link) > 30:
+            return link
+    return links[0] if links else None
 
 def escape_markdown(text):
     if not text:
@@ -238,11 +224,9 @@ async def save_user(user_id, account):
     email = extract_value(account.get('email', ''))
     token = extract_value(account.get('token', ''))
     account_id = extract_value(account.get('account_id', ''))
-    
     messages = account.get('messages', [])
     if not isinstance(messages, list):
         messages = []
-    
     sql = '''
         INSERT OR REPLACE INTO users (user_id, email, token, account_id, messages, read_ids)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -281,7 +265,6 @@ async def load_all_users_to_cache():
     sql = 'SELECT user_id, email, token, account_id, messages, read_ids FROM users'
     result = await turso.execute(sql)
     rows = result.get('result', {}).get('rows', [])
-    
     for row in rows:
         if isinstance(row, (list, tuple)):
             if len(row) >= 6:
@@ -308,11 +291,9 @@ async def load_all_users_to_cache():
                 'messages': messages,
                 'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
             }
-    
     for uid in user_accounts_cache:
         if not isinstance(user_accounts_cache[uid].get('messages'), list):
             user_accounts_cache[uid]['messages'] = []
-    
     if rows:
         logger.info(f"✅ Loaded {len(rows)} users from Turso")
 
@@ -369,31 +350,32 @@ async def check_mailcat(account):
                         html = email_data.get('email', {}).get('html', '')
                         text = email_data.get('email', {}).get('text', '')
                         
-                        # ИЗВЛЕКАЕМ ССЫЛКИ ИЗ HTML
-                        html_links = extract_links_from_html(html)
+                        # Очищаем текст от мусора
+                        clean_text = clean_text_from_email(html)
+                        if not clean_text:
+                            clean_text = clean_text_from_email(text)
                         
-                        # Текст без HTML
-                        clean_text = re.sub(r'<[^>]+>', ' ', html)
-                        clean_text = re.sub(r'\s+', ' ', clean_text)
-                        clean_text = clean_text[:500].strip()
+                        # Извлекаем все ссылки
+                        all_links = extract_links_from_html(html) + extract_links_from_html(clean_text)
                         
-                        # Ищем код
-                        code = extract_code(clean_text)
-                        
-                        # Объединяем ссылки
-                        all_links = html_links + extract_links(clean_text)
                         # Убираем дубли
                         unique_links = []
                         for link in all_links:
                             if link not in unique_links:
                                 unique_links.append(link)
                         
+                        # Находим ссылку для подтверждения
+                        confirm_link = find_confirmation_link(unique_links)
+                        
+                        # Сохраняем только ссылку для подтверждения
+                        links_to_save = [confirm_link] if confirm_link else []
+                        
                         new_messages.append({
                             'sender': sender,
                             'subject': subject,
-                            'body': clean_text,
-                            'code': code,
-                            'links': unique_links[:5],
+                            'body': clean_text[:500],
+                            'code': None,
+                            'links': links_to_save,
                             'received_at': datetime.now().isoformat()
                         })
         return new_messages
@@ -451,7 +433,6 @@ async def send_bot_message(user_id, text, reply_markup=None):
         except:
             pass
         bot_messages.pop(user_id, None)
-    
     try:
         sent = await bot.send_message(
             user_id,
@@ -472,7 +453,6 @@ async def show_main_screen(user_id):
         account = await get_user(user_id)
         if account:
             user_accounts_cache[user_id] = account
-    
     if not account:
         await send_bot_message(
             user_id,
@@ -482,20 +462,12 @@ async def show_main_screen(user_id):
             main_keyboard_no_account()
         )
         return
-    
     if not isinstance(account.get('messages'), list):
         account['messages'] = []
-    
     valid_messages = [m for m in account['messages'] if isinstance(m, dict)]
     msg_count = len(valid_messages)
-    codes = [m.get('code') for m in valid_messages if m.get('code')]
-    code_count = len(codes)
-    
     text = f"📧 **Ваш ящик:**\n`{account['email']}`\n\n"
     text += f"📨 Писем: **{msg_count}**\n"
-    if code_count:
-        text += f"🔑 Кодов: **{code_count}**"
-    
     await send_bot_message(
         user_id,
         text,
@@ -541,7 +513,6 @@ async def create_handler(message: types.Message):
             main_keyboard_no_account()
         )
 
-# ===== ОБРАБОТЧИК ДЛЯ ПРОСМОТРА ТЕКСТА ПИСЬМА =====
 @dp.callback_query_handler(lambda c: c.data.startswith("show_body_"))
 async def show_body_callback(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
@@ -549,46 +520,33 @@ async def show_body_callback(callback: types.CallbackQuery):
     if len(parts) < 3:
         await callback.answer("❌ Ошибка", show_alert=True)
         return
-    
     try:
         idx = int(parts[2])
     except:
         await callback.answer("❌ Ошибка", show_alert=True)
         return
-    
     account = user_accounts_cache.get(user_id) or await get_user(user_id)
     if not account:
         await callback.answer("❌ Аккаунт не найден", show_alert=True)
         return
-    
     valid_messages = [m for m in account.get('messages', []) if isinstance(m, dict)]
     if idx < 1 or idx > len(valid_messages):
         await callback.answer("❌ Письмо не найдено", show_alert=True)
         return
-    
     msg = valid_messages[-idx]
-    
     body = msg.get('body', 'Нет текста')
     body = escape_markdown(body)
-    
     text = f"📄 **Полный текст письма**\n\n"
     text += f"📌 **От:** {msg.get('sender', 'unknown')}\n"
     text += f"📌 **Тема:** {msg.get('subject', '(no subject)')}\n"
     text += f"📌 **Время:** {datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M %d.%m.%Y')}\n\n"
     text += f"📝 **Текст:**\n{body[:1000]}"
-    
     if len(body) > 1000:
         text += f"\n\n... (текст обрезан, всего символов: {len(body)})"
-    
-    # Добавляем ссылки если есть
-    if msg.get('links'):
-        text += f"\n\n🔗 **Ссылки:**\n"
-        for link in msg['links'][:3]:
-            text += f"• {link}\n"
-    
+    if msg.get('links') and msg['links'][0]:
+        text += f"\n\n🔗 **Ссылка для подтверждения:**\n{msg['links'][0]}"
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(InlineKeyboardButton("🔙 Назад к письмам", callback_data="back_to_messages"))
-    
     try:
         await callback.message.edit_text(text, parse_mode='Markdown', reply_markup=keyboard)
     except Exception as e:
@@ -597,7 +555,6 @@ async def show_body_callback(callback: types.CallbackQuery):
         else:
             logger.error(f"Show body error: {e}")
             await callback.answer("❌ Ошибка отображения", show_alert=True)
-    
     await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_messages")
@@ -633,26 +590,17 @@ async def check_handler(message: types.Message):
                 back_keyboard()
             )
             return
-        
         text = f"📩 **Письма ({len(valid_messages)}):**\n\n"
         for i, msg in enumerate(valid_messages[-10:][::-1], 1):
             time = datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M')
             text += f"{i}. [{time}] **{msg.get('subject', '(no subject)')[:35]}**\n"
             text += f"   От: {msg.get('sender', 'unknown')[:30]}\n"
-            if msg.get('code'):
-                text += f"   🔑 Код: `{msg['code']}`\n"
-            if msg.get('links'):
-                link = msg['links'][0]
-                if isinstance(link, str):
-                    text += f"   🔗 {link}\n"
-                else:
-                    text += f"   🔗 {str(link)}\n"
+            if msg.get('links') and msg['links'][0]:
+                text += f"   🔗 {msg['links'][0]}\n"
             text += "\n"
-        
         if len(valid_messages) > 10:
             text += f"... и еще {len(valid_messages)-10} писем\n"
         text += f"\n📌 **Всего:** {len(valid_messages)}"
-        
         keyboard = InlineKeyboardMarkup(row_width=2)
         for idx in range(1, min(len(valid_messages), 10) + 1):
             keyboard.insert(InlineKeyboardButton(
@@ -660,9 +608,7 @@ async def check_handler(message: types.Message):
                 callback_data=f"show_body_{idx}"
             ))
         keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_main"))
-        
         await send_bot_message(user_id, text, keyboard)
-        
     except Exception as e:
         logger.error(f"Check error: {e}")
         await send_bot_message(
@@ -757,24 +703,16 @@ async def background_check():
                             account['messages'] = []
                             await save_user(user_id, account)
                             logger.info(f"✅ Fixed messages for user {user_id}")
-                        
                         new = await check_mailcat(account)
                         if new:
                             account['messages'].extend(new)
                             await save_user(user_id, account)
-                            
                             msg = new[0]
                             text = f"📨 **Новое письмо!**\n\n"
                             text += f"От: {msg['sender'][:35]}\n"
                             text += f"Тема: {msg['subject'][:40]}\n"
-                            if msg.get('code'):
-                                text += f"🔑 Код: `{msg['code']}`\n"
-                            if msg.get('links'):
-                                link = msg['links'][0]
-                                if isinstance(link, str):
-                                    text += f"🔗 {link}\n"
-                                else:
-                                    text += f"🔗 {str(link)}\n"
+                            if msg.get('links') and msg['links'][0]:
+                                text += f"🔗 {msg['links'][0]}\n"
                             text += f"\n📌 Нажмите «Проверить почту» для просмотра"
                             await bot.send_message(int(user_id), text, parse_mode='Markdown')
                 except Exception as e:
