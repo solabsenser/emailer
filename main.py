@@ -150,20 +150,34 @@ async def start_web():
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-def get_main_menu():
+# ===== НОВЫЕ КЛАВИАТУРЫ =====
+def main_menu_no_account():
+    """Главное меню, когда нет ящика"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("📧 Создать почту", callback_data="create")
+    )
+    return keyboard
+
+def main_menu_with_account(email, msg_count, code_count):
+    """Главное меню, когда есть ящик"""
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
-        InlineKeyboardButton("📧 Создать почту", callback_data="create"),
-        InlineKeyboardButton("📬 Мои ящики", callback_data="list"),
-        InlineKeyboardButton("📨 Проверить почту", callback_data="check"),
-        InlineKeyboardButton("🗑 Удалить ящик", callback_data="delete")
+        InlineKeyboardButton(f"📨 Почта ({msg_count})", callback_data="check"),
+        InlineKeyboardButton("🗑 Удалить", callback_data="delete")
+    )
+    return keyboard
+
+def back_menu():
+    """Кнопка назад"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
     )
     return keyboard
 
 async def update_or_send(user_id, text, reply_markup=None):
-    """Гарантированно редактирует ОДНО сообщение"""
     msg_id = user_messages.get(user_id)
-    
     if msg_id:
         try:
             await bot.edit_message_text(
@@ -182,7 +196,6 @@ async def update_or_send(user_id, text, reply_markup=None):
             else:
                 logger.error(f"Edit error: {e}")
                 user_messages.pop(user_id, None)
-    
     try:
         sent = await bot.send_message(
             user_id,
@@ -194,137 +207,151 @@ async def update_or_send(user_id, text, reply_markup=None):
     except Exception as e:
         logger.error(f"Send error: {e}")
 
+async def show_main_screen(user_id):
+    """Показывает главный экран"""
+    account = user_accounts.get(str(user_id))
+    
+    if not account:
+        await update_or_send(
+            user_id,
+            "📧 **Временная почта**\n\n"
+            "Создайте временный email для регистрации\n"
+            "Письма приходят автоматически",
+            main_menu_no_account()
+        )
+        return
+    
+    msg_count = len(account.get('messages', []))
+    codes = [m.get('code') for m in account.get('messages', []) if m.get('code')]
+    code_count = len(codes)
+    
+    text = f"📧 **Ваш ящик:**\n`{account['email']}`\n\n"
+    text += f"📨 Писем: **{msg_count}**\n"
+    if code_count:
+        text += f"🔑 Кодов: **{code_count}**"
+    
+    await update_or_send(
+        user_id,
+        text,
+        main_menu_with_account(account['email'], msg_count, code_count)
+    )
+
 @dp.message_handler(commands=['start', 'menu'])
 async def start(message: types.Message):
     user_id = message.from_user.id
     user_messages[user_id] = message.message_id
-    await update_or_send(
-        user_id,
-        "📧 **Временная почта**\n\n"
-        "Создавайте email и получайте письма\n"
-        "🌐 Используется MailCat\n\n"
-        "🔑 Бот находит коды и ссылки из писем!",
-        get_main_menu()
-    )
+    await show_main_screen(user_id)
 
 @dp.message_handler()
 async def any_message(message: types.Message):
     user_id = message.from_user.id
     user_messages[user_id] = message.message_id
-    await update_or_send(user_id, "📧 Используйте кнопки:", get_main_menu())
+    await show_main_screen(user_id)
 
 @dp.callback_query_handler(lambda c: c.data == "create")
 async def create_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
+    
     if str(user_id) in user_accounts:
-        await update_or_send(user_id, "❌ **У вас уже есть ящик**", get_main_menu())
+        await show_main_screen(user_id)
         return
+    
     try:
         account = await create_mailcat_mailbox()
         user_accounts[str(user_id)] = account
-        await update_or_send(
-            user_id,
-            f"✅ **Создан email:**\n`{account['email']}`\n\n"
-            f"📩 Используйте для регистрации",
-            get_main_menu()
-        )
+        await show_main_screen(user_id)
     except Exception as e:
         logger.error(f"Create error: {e}")
-        await update_or_send(user_id, f"❌ **Ошибка:** {str(e)[:200]}", get_main_menu())
-
-@dp.callback_query_handler(lambda c: c.data == "list")
-async def list_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
-    account = user_accounts.get(str(user_id))
-    if not account:
-        await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
-        return
-    msg_count = len(account.get('messages', []))
-    await update_or_send(
-        user_id,
-        f"📬 **Ваш ящик:**\n`{account['email']}`\n\n📨 Писем: {msg_count}",
-        get_main_menu()
-    )
+        await update_or_send(
+            user_id,
+            f"❌ **Ошибка создания**\n\n{str(e)[:200]}",
+            main_menu_no_account()
+        )
 
 @dp.callback_query_handler(lambda c: c.data == "check")
 async def check_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
+    
     account = user_accounts.get(str(user_id))
     if not account:
-        await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
+        await show_main_screen(user_id)
         return
-    await update_or_send(user_id, "🔄 **Проверяю...**", get_main_menu())
+    
+    # Проверяем почту
+    await update_or_send(user_id, "🔄 **Проверяю почту...**", None)
+    
     try:
         new = await check_mailcat(account)
         if new:
             account.setdefault('messages', []).extend(new)
-            codes = [msg.get('code') for msg in new if msg.get('code')]
-            links = []
-            for msg in new:
-                links.extend(msg.get('links', []))
-            response = f"✅ **{len(new)} новых писем!**\n"
-            if codes:
-                response += "\n🔑 **Коды:**\n" + "\n".join([f"• `{c}`" for c in codes[:5]])
-            if links:
-                response += "\n\n🔗 **Ссылки:**\n" + "\n".join([f"• {link[:60]}..." if len(link) > 60 else f"• {link}" for link in links[:5]])
-            if not codes and not links:
-                response += "\n\n📝 Нажмите «Мои ящики» для просмотра"
-            await update_or_send(user_id, response, get_main_menu())
-        else:
-            total = len(account.get('messages', []))
-            await update_or_send(user_id, f"📭 **Новых писем нет**\nВсего: {total}", get_main_menu())
+        
+        messages = account.get('messages', [])
+        if not messages:
+            await update_or_send(
+                user_id,
+                "📭 **Писем нет**\n\nНажмите «Назад» для возврата",
+                back_menu()
+            )
+            return
+        
+        # Показываем список писем
+        text = f"📩 **Письма ({len(messages)}):**\n\n"
+        for i, msg in enumerate(messages[-10:][::-1], 1):
+            time = msg['received_at'].strftime('%H:%M')
+            text += f"{i}. [{time}] **{msg['subject'][:35]}**\n"
+            text += f"   От: {msg['sender'][:30]}\n"
+            if msg.get('code'):
+                text += f"   🔑 Код: `{msg['code']}`\n"
+            if msg.get('links'):
+                for link in msg['links'][:1]:
+                    text += f"   🔗 {link[:40]}...\n"
+            text += "\n"
+        
+        if len(messages) > 10:
+            text += f"... и еще {len(messages)-10} писем\n"
+        
+        text += f"\n📌 **Всего:** {len(messages)}"
+        
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        keyboard.add(
+            InlineKeyboardButton("🔄 Обновить", callback_data="check"),
+            InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
+        )
+        
+        await update_or_send(user_id, text, keyboard)
+        
     except Exception as e:
-        await update_or_send(user_id, f"❌ **Ошибка:** {str(e)[:200]}", get_main_menu())
-
-@dp.callback_query_handler(lambda c: c.data.startswith("view_"))
-async def view_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
-    account = user_accounts.get(str(user_id))
-    if not account:
-        await update_or_send(user_id, "❌ **Нет ящика**", get_main_menu())
-        return
-    messages = account.get('messages', [])
-    if not messages:
-        await update_or_send(user_id, "📭 **Нет писем**", get_main_menu())
-        return
-    text = f"📩 **Письма:**\n\n"
-    for i, msg in enumerate(messages[-10:][::-1], 1):
-        text += f"{i}. **{msg['subject'][:40]}**\n"
-        text += f"   От: {msg['sender'][:35]}\n"
-        if msg.get('code'):
-            text += f"   🔑 Код: `{msg['code']}`\n"
-        if msg.get('links'):
-            for link in msg['links'][:2]:
-                text += f"   🔗 {link[:50]}...\n"
-        text += "\n"
-    text += f"\n📌 **Всего:** {len(messages)}"
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("🔙 Назад", callback_data="check"),
-        InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu")
-    )
-    await update_or_send(user_id, text, keyboard)
+        logger.error(f"Check error: {e}")
+        await update_or_send(
+            user_id,
+            f"❌ **Ошибка проверки**\n\n{str(e)[:200]}",
+            back_menu()
+        )
 
 @dp.callback_query_handler(lambda c: c.data == "delete")
 async def delete_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
+    
     account = user_accounts.get(str(user_id))
     if not account:
-        await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
+        await show_main_screen(user_id)
         return
+    
     del user_accounts[str(user_id)]
-    await update_or_send(user_id, f"🗑 **Ящик удалён**", get_main_menu())
+    await update_or_send(
+        user_id,
+        "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости",
+        main_menu_no_account()
+    )
 
-@dp.callback_query_handler(lambda c: c.data == "back_to_menu")
-async def back_to_menu_callback(callback: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == "back_to_main")
+async def back_to_main_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
-    await update_or_send(user_id, "📧 **Главное меню**", get_main_menu())
+    await show_main_screen(user_id)
 
 async def background_check():
     while True:
@@ -334,12 +361,18 @@ async def background_check():
                     new = await check_mailcat(account)
                     if new:
                         account.setdefault('messages', []).extend(new)
-                        msg_text = f"📨 **Новое письмо!**\nОт: {new[0]['sender'][:35]}\nТема: {new[0]['subject'][:40]}"
-                        if new[0].get('code'):
-                            msg_text += f"\n🔑 Код: `{new[0]['code']}`"
-                        if new[0].get('links'):
-                            msg_text += f"\n🔗 {new[0]['links'][0][:60]}..."
-                        await bot.send_message(int(user_id), msg_text, parse_mode='Markdown')
+                        
+                        # Формируем уведомление
+                        msg = new[0]
+                        text = f"📨 **Новое письмо!**\n\n"
+                        text += f"От: {msg['sender'][:35]}\n"
+                        text += f"Тема: {msg['subject'][:40]}\n"
+                        if msg.get('code'):
+                            text += f"🔑 Код: `{msg['code']}`\n"
+                        if msg.get('links'):
+                            text += f"🔗 {msg['links'][0][:60]}"
+                        
+                        await bot.send_message(int(user_id), text, parse_mode='Markdown')
                 except:
                     pass
         except:
