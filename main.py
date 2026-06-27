@@ -9,7 +9,7 @@ import json
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 import os
 
@@ -162,16 +162,28 @@ def serialize_messages(messages):
     return json.dumps(messages, ensure_ascii=False)
 
 def deserialize_messages(data):
+    """Превращает данные из Turso в список, что бы там ни лежало"""
     if not data:
         return []
+    
+    if isinstance(data, list):
+        return data
+    
     if isinstance(data, str):
         try:
-            return json.loads(data)
+            parsed = json.loads(data)
+            if isinstance(parsed, list):
+                return parsed
+            return [parsed] if parsed else []
         except:
             return []
-    if isinstance(data, (list, dict)):
-        return data
-    return []
+    
+    if isinstance(data, dict):
+        if 'value' in data:
+            return [data['value']] if data['value'] else []
+        return [data] if data else []
+    
+    return [data] if data else []
 
 async def init_db():
     sql = '''
@@ -622,6 +634,7 @@ async def background_check():
                         if not isinstance(account.get('messages'), list):
                             account['messages'] = []
                             await save_user(user_id, account)
+                            logger.info(f"🔧 Fixed messages for {user_id}")
                         new = await check_mailcat(account)
                         if new:
                             account['messages'].extend(new)
@@ -634,7 +647,7 @@ async def background_check():
                                 text += f"\n🔗 {msg['links'][0]}"
                             await bot.send_message(int(user_id), text, parse_mode='Markdown')
                 except Exception as e:
-                    logger.error(f"Background error: {e}")
+                    logger.error(f"Background error for {user_id}: {e}")
         except Exception as e:
             logger.error(f"Background error: {e}")
         await asyncio.sleep(30)
