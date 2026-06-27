@@ -106,43 +106,14 @@ def decode_header_value(value):
         return value
 
 def decode_quoted_printable(text):
-    """Декодирует quoted-printable текст в UTF-8"""
+    """Декодирует quoted-printable текст"""
     if not text:
         return ''
     try:
-        # Декодируем quoted-printable
         decoded = quopri.decodestring(text.encode('utf-8'))
-        # Пробуем декодировать в UTF-8
-        try:
-            return decoded.decode('utf-8', errors='ignore')
-        except:
-            # Если не получилось — пробуем Windows-1251
-            try:
-                return decoded.decode('windows-1251', errors='ignore')
-            except:
-                return decoded.decode('utf-8', errors='ignore')
-    except Exception as e:
-        logger.error(f"Decode error: {e}")
+        return decoded.decode('utf-8', errors='ignore')
+    except:
         return text
-
-def clean_body(body):
-    """Очищает и декодирует тело письма"""
-    if not body:
-        return ''
-    
-    # Сначала декодируем quoted-printable
-    body = decode_quoted_printable(body)
-    
-    # Убираем HTML теги
-    body = re.sub(r'<[^>]+>', ' ', body)
-    
-    # Убираем множественные пробелы и переносы
-    body = re.sub(r'\s+', ' ', body)
-    
-    # Убираем base64 и прочий мусор
-    body = re.sub(r'[A-Za-z0-9+/=]{50,}', '', body)
-    
-    return body[:500].strip()
 
 def extract_code(text):
     if not text:
@@ -382,19 +353,24 @@ async def check_mailcat(account):
                         raw_from = email_data.get('email', {}).get('from', 'unknown')
                         sender = decode_header_value(raw_from)
                         
-                        body = email_data.get('email', {}).get('text', '')
-                        if not body:
-                            body = email_data.get('email', {}).get('html', '')
+                        # Получаем тело
+                        body = email_data.get('email', {}).get('html', '') or email_data.get('email', {}).get('text', '')
                         
-                        # Теперь чистим тело с декодированием
-                        clean_text = clean_body(body)
-                        code = extract_code(clean_text)
-                        links = extract_links(clean_text)
+                        # ДЕКОДИРУЕМ quoted-printable
+                        body = decode_quoted_printable(body)
+                        
+                        # Убираем HTML теги
+                        body = re.sub(r'<[^>]+>', ' ', body)
+                        body = re.sub(r'\s+', ' ', body)
+                        body = body[:500].strip()
+                        
+                        code = extract_code(body)
+                        links = extract_links(body)
                         
                         new_messages.append({
                             'sender': sender,
                             'subject': subject,
-                            'body': clean_text[:500],
+                            'body': body,
                             'code': code,
                             'links': links[:3],
                             'received_at': datetime.now().isoformat()
@@ -573,11 +549,7 @@ async def show_body_callback(callback: types.CallbackQuery):
     
     # Получаем тело и декодируем
     body = msg.get('body', 'Нет текста')
-    # Декодируем quoted-printable если нужно
-    if '=' in body:
-        body = decode_quoted_printable(body)
-    
-    # Экранируем для Markdown
+    body = decode_quoted_printable(body)
     body = escape_markdown(body)
     
     text = f"📄 **Полный текст письма**\n\n"
