@@ -2,10 +2,9 @@ import asyncio
 import logging
 import secrets
 import string
+import aiohttp
 from datetime import datetime
 from collections import defaultdict
-from email import message_from_bytes
-from email.policy import default
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -13,77 +12,88 @@ from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
 from dotenv import load_dotenv
 import os
 
-# Полностью отключаем логи SMTP
-logging.getLogger('mail').setLevel(logging.ERROR)
-logging.getLogger('aiosmtpd').setLevel(logging.ERROR)
-
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ===== КОНФИГ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DOMAIN = os.getenv("DOMAIN", "temp.local")
 PORT = int(os.getenv("PORT", 10000))
+DOMAIN = "mail.tm"  # Используем mail.tm
 
 # ===== ХРАНИЛИЩЕ =====
-mailboxes = {}
-user_emails = defaultdict(list)
+user_accounts = {}  # {user_id: {email, password, token, messages: []}}
 user_messages = {}
 
-def generate_email():
-    alphabet = string.ascii_lowercase + string.digits
-    local = ''.join(secrets.choice(alphabet) for _ in range(8))
-    return f"{local}@{DOMAIN}"
+# ===== MAIL.TM API =====
+MAIL_API = "https://api.mail.tm"
 
-# ===== SMTP (запускается в отдельном потоке, тихо) =====
-def start_smtp():
-    try:
-        from aiosmtpd.controller import Controller
+async def create_mail_account():
+    """Создает временный email через mail.tm"""
+    async with aiohttp.ClientSession() as session:
+        # Генерируем случайный адрес
+        local = ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+        email = f"{local}@{DOMAIN}"
+        password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
         
-        class MailHandler:
-            async def handle_DATA(self, server, session, envelope):
-                try:
-                    if not envelope or not envelope.rcpt_tos:
-                        return '500 Ignored'
-                    
-                    recipient = envelope.rcpt_tos[0]
-                    if recipient not in mailboxes:
-                        return f'550 Mailbox {recipient} not found'
-                    
-                    msg = message_from_bytes(envelope.content, policy=default)
-                    subject = msg.get('Subject', '(no subject)')
-                    sender = msg.get('From', 'unknown')
-                    
-                    body = ''
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            if part.get_content_type() == 'text/plain':
-                                body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                break
-                    else:
-                        payload = msg.get_payload(decode=True)
-                        if payload:
-                            body = payload.decode('utf-8', errors='ignore')
-                    
-                    mailboxes[recipient].setdefault('messages', []).append({
-                        'sender': sender,
-                        'subject': subject,
-                        'body': body[:5000],
-                        'received_at': datetime.utcnow()
-                    })
-                    
-                    return '250 OK'
-                except Exception:
-                    return '550 Error'
+        # Регистрируем аккаунт
+        async with session.post(f"{MAIL_API}/accounts", json={
+            "address": email,
+            "password": password
+        }) as resp:
+            if resp.status != 201:
+                raise Exception("Failed to create account")
+            data = await resp.json()
+            account_id = data.get('id')
         
-        controller = Controller(MailHandler(), hostname='127.0.0.1', port=2525)
-        controller.start()
-        logger.info("✅ SMTP server running on 127.0.0.1:2525")
-        return controller
-    except Exception as e:
-        logger.warning(f"SMTP not started: {e}")
-        return None
+        # Получаем токен
+        async with session.post(f"{MAIL_API}/token", json={
+            "address": email,
+            "password": password
+        }) as resp:
+            if resp.status != 200:
+                raise Exception("Failed to get token")
+            data = await resp.json()
+            token = data.get('token')
+        
+        return {
+            'email': email,
+            'password': password,
+            'token': token,
+            'account_id': account_id,
+            'messages': []
+        }
+
+async def check_mail(account):
+    """Проверяет новые письма"""
+    async with aiohttp.ClientSession() as session:
+        headers = {"Authorization": f"Bearer {account['token']}"}
+        
+        # Получаем список писем
+        async with session.get(f"{MAIL_API}/messages", headers=headers) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            messages = data.get('hydra:member', [])
+        
+        new_messages = []
+        for msg in messages:
+            msg_id = msg.get('id')
+            # Проверяем, не читали ли уже
+            if msg_id not in account.get('read_ids', []):
+                # Получаем полное письмо
+                async with session.get(f"{MAIL_API}/messages/{msg_id}", headers=headers) as resp2:
+                    if resp2.status == 200:
+                        full = await resp2.json()
+                        account.setdefault('read_ids', []).append(msg_id)
+                        new_messages.append({
+                            'sender': full.get('from', {}).get('address', 'unknown'),
+                            'subject': full.get('subject', '(no subject)'),
+                            'body': full.get('text', '') or full.get('html', ''),
+                            'received_at': datetime.fromisoformat(full.get('createdAt', datetime.now().isoformat()).replace('Z', '+00:00'))
+                        })
+        
+        return new_messages
 
 # ===== WEB СЕРВЕР =====
 async def health_check(request):
@@ -151,7 +161,8 @@ async def start(message: types.Message):
         user_id,
         "📧 **Временная почта**\n\n"
         "Создавайте email и получайте письма в Telegram\n"
-        f"🌐 Домен: `{DOMAIN}`",
+        "🌐 Используется mail.tm\n\n"
+        "⚠️ Письма приходят с задержкой до 30 секунд",
         get_main_menu()
     )
 
@@ -159,12 +170,7 @@ async def start(message: types.Message):
 async def any_message(message: types.Message):
     user_id = message.from_user.id
     user_messages[user_id] = message.message_id
-    
-    await safe_edit(
-        user_id,
-        "📧 Используйте кнопки ниже:",
-        get_main_menu()
-    )
+    await safe_edit(user_id, "📧 Используйте кнопки ниже:", get_main_menu())
 
 @dp.callback_query_handler(lambda c: True)
 async def handle_callbacks(callback: types.CallbackQuery):
@@ -174,71 +180,78 @@ async def handle_callbacks(callback: types.CallbackQuery):
     await callback.answer()
     
     if data == "create":
-        if len(user_emails[str(user_id)]) >= 10:
-            await safe_edit(user_id, "❌ **Максимум 10 ящиков**", get_main_menu())
+        if str(user_id) in user_accounts:
+            await safe_edit(user_id, "❌ **У вас уже есть ящик**\n\nУдалите старый перед созданием нового", get_main_menu())
             return
         
-        for _ in range(10):
-            email = generate_email()
-            if email not in mailboxes:
-                mailboxes[email] = {'user_id': str(user_id), 'messages': []}
-                user_emails[str(user_id)].append(email)
-                
-                await safe_edit(
-                    user_id,
-                    f"✅ **Создан email:**\n`{email}`\n\n📩 Отправляйте письма на этот адрес",
-                    get_main_menu()
-                )
-                return
-        
-        await safe_edit(user_id, "❌ **Ошибка создания**", get_main_menu())
+        try:
+            account = await create_mail_account()
+            user_accounts[str(user_id)] = account
+            
+            await safe_edit(
+                user_id,
+                f"✅ **Создан email:**\n`{account['email']}`\n\n"
+                f"📩 Отправляйте письма на этот адрес\n"
+                f"🔄 Нажмите «Проверить почту» для получения писем\n"
+                f"⏳ Письма приходят с задержкой до 30 секунд",
+                get_main_menu()
+            )
+        except Exception as e:
+            logger.error(f"Create error: {e}")
+            await safe_edit(user_id, "❌ **Ошибка создания**\nПопробуйте позже", get_main_menu())
     
     elif data == "list":
-        emails = [e for e in user_emails.get(str(user_id), []) if e in mailboxes]
-        
-        if not emails:
-            await safe_edit(user_id, "📭 **У вас нет ящиков**", get_main_menu())
+        account = user_accounts.get(str(user_id))
+        if not account:
+            await safe_edit(user_id, "📭 **У вас нет ящика**\n\nНажмите «Создать почту»", get_main_menu())
             return
         
-        text = "📬 **Ваши ящики:**\n\n"
-        for email in emails:
-            msg_count = len(mailboxes[email].get('messages', []))
-            text += f"• `{email}` — 📨 {msg_count} писем\n"
-        
-        await safe_edit(user_id, text, get_main_menu())
+        msg_count = len(account.get('messages', []))
+        await safe_edit(
+            user_id,
+            f"📬 **Ваш ящик:**\n`{account['email']}`\n\n📨 Писем: {msg_count}",
+            get_main_menu()
+        )
     
     elif data == "check":
-        emails = [e for e in user_emails.get(str(user_id), []) if e in mailboxes]
-        
-        if not emails:
-            await safe_edit(user_id, "📭 **Нет ящиков**", get_main_menu())
+        account = user_accounts.get(str(user_id))
+        if not account:
+            await safe_edit(user_id, "📭 **Нет ящика**\n\nНажмите «Создать почту»", get_main_menu())
             return
         
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        for email in emails:
-            msg_count = len(mailboxes[email].get('messages', []))
-            keyboard.add(InlineKeyboardButton(
-                f"📨 {email} ({msg_count})",
-                callback_data=f"view_{email}"
-            ))
-        keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu"))
+        await safe_edit(user_id, "🔄 **Проверяю почту...**", get_main_menu())
         
-        await safe_edit(user_id, "📨 **Выберите ящик:**", keyboard)
+        try:
+            new_messages = await check_mail(account)
+            if new_messages:
+                account.setdefault('messages', []).extend(new_messages)
+                await safe_edit(
+                    user_id,
+                    f"✅ **Получено {len(new_messages)} новых писем!**\n\nНажмите ещё раз для просмотра",
+                    get_main_menu()
+                )
+            else:
+                await safe_edit(
+                    user_id,
+                    f"📭 **Новых писем нет**\n\nВсего писем: {len(account.get('messages', []))}",
+                    get_main_menu()
+                )
+        except Exception as e:
+            logger.error(f"Check error: {e}")
+            await safe_edit(user_id, "❌ **Ошибка проверки**\nПопробуйте позже", get_main_menu())
     
     elif data.startswith("view_"):
-        email = data.replace("view_", "")
-        
-        if email not in mailboxes or mailboxes[email].get('user_id') != str(user_id):
-            await safe_edit(user_id, "❌ **Ящик не найден**", get_main_menu())
+        account = user_accounts.get(str(user_id))
+        if not account:
+            await safe_edit(user_id, "❌ **Нет ящика**", get_main_menu())
             return
         
-        messages = mailboxes[email].get('messages', [])
-        
+        messages = account.get('messages', [])
         if not messages:
-            await safe_edit(user_id, f"📭 **Писем для `{email}` нет**", get_main_menu())
+            await safe_edit(user_id, "📭 **Нет писем**", get_main_menu())
             return
         
-        text = f"📩 **Письма для `{email}`:**\n\n"
+        text = f"📩 **Письма для `{account['email']}`:**\n\n"
         for i, msg in enumerate(messages[-10:][::-1], 1):
             time = msg['received_at'].strftime('%H:%M %d.%m')
             text += f"{i}. [{time}] **{msg['subject'][:35]}**\n"
@@ -255,67 +268,87 @@ async def handle_callbacks(callback: types.CallbackQuery):
         
         keyboard = InlineKeyboardMarkup(row_width=2)
         keyboard.add(
-            InlineKeyboardButton("🔙 К ящикам", callback_data="check"),
+            InlineKeyboardButton("🔄 Проверить", callback_data="check"),
             InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu")
         )
         
         await safe_edit(user_id, text, keyboard)
     
     elif data == "delete":
-        emails = [e for e in user_emails.get(str(user_id), []) if e in mailboxes]
-        
-        if not emails:
-            await safe_edit(user_id, "📭 **Нет ящиков**", get_main_menu())
+        account = user_accounts.get(str(user_id))
+        if not account:
+            await safe_edit(user_id, "📭 **Нет ящика для удаления**", get_main_menu())
             return
         
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        for email in emails:
-            msg_count = len(mailboxes[email].get('messages', []))
-            keyboard.add(InlineKeyboardButton(
-                f"🗑 {email} ({msg_count})",
-                callback_data=f"del_{email}"
-            ))
-        keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="back_to_menu"))
+        # Удаляем аккаунт на mail.tm
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"Authorization": f"Bearer {account['token']}"}
+                await session.delete(f"{MAIL_API}/accounts/{account['account_id']}", headers=headers)
+        except Exception as e:
+            logger.error(f"Delete error: {e}")
         
-        await safe_edit(user_id, "⚠️ **Выберите ящик для удаления:**", keyboard)
-    
-    elif data.startswith("del_"):
-        email = data.replace("del_", "")
-        
-        if email in mailboxes and mailboxes[email].get('user_id') == str(user_id):
-            user_emails[str(user_id)].remove(email)
-            del mailboxes[email]
-            
-            await safe_edit(user_id, f"🗑 **Ящик удалён:**\n`{email}`", get_main_menu())
-        else:
-            await safe_edit(user_id, "❌ **Ящик не найден**", get_main_menu())
+        del user_accounts[str(user_id)]
+        await safe_edit(user_id, f"🗑 **Ящик удалён:**\n`{account['email']}`", get_main_menu())
     
     elif data == "back_to_menu":
         await safe_edit(user_id, "📧 **Главное меню**", get_main_menu())
+    
+    else:
+        # Если нажали на письмо - показываем его
+        if data.startswith("msg_"):
+            # Можно реализовать просмотр конкретного письма
+            await safe_edit(user_id, "📖 Функция в разработке", get_main_menu())
 
-# ===== ЗАПУСК С ПЕРЕЗАПУСКОМ ПРИ КОНФЛИКТЕ =====
+# ===== ФОНОВАЯ ПРОВЕРКА ПОЧТЫ =====
+async def background_check():
+    """Проверяет почту каждые 30 секунд для всех пользователей"""
+    while True:
+        try:
+            for user_id, account in list(user_accounts.items()):
+                if account:
+                    try:
+                        new_messages = await check_mail(account)
+                        if new_messages:
+                            account.setdefault('messages', []).extend(new_messages)
+                            # Уведомляем пользователя
+                            try:
+                                await bot.send_message(
+                                    int(user_id),
+                                    f"📨 **Новое письмо!**\n\n"
+                                    f"От: {new_messages[0]['sender']}\n"
+                                    f"Тема: {new_messages[0]['subject']}\n\n"
+                                    f"Нажмите «Проверить почту» для просмотра",
+                                    parse_mode='Markdown'
+                                )
+                            except:
+                                pass
+                    except:
+                        pass
+        except:
+            pass
+        await asyncio.sleep(30)
+
 async def start_bot_with_retry():
-    """Запускает бота с обработкой конфликта"""
     while True:
         try:
             logger.info("🚀 Starting bot...")
             await dp.start_polling(bot)
             break
         except TerminatedByOtherGetUpdates:
-            logger.warning("⚠️ Conflict detected, waiting 5 seconds and retrying...")
+            logger.warning("⚠️ Conflict detected, waiting 5 seconds...")
             await asyncio.sleep(5)
         except Exception as e:
             logger.error(f"Bot error: {e}")
             await asyncio.sleep(5)
 
 async def main():
-    # Запускаем SMTP (тихо)
-    smtp = start_smtp()
-    
-    # Запускаем Web
     await start_web()
     
-    # Запускаем бота с автоматическим перезапуском
+    # Запускаем фоновую проверку
+    asyncio.create_task(background_check())
+    logger.info("🔄 Background mail checker started")
+    
     await start_bot_with_retry()
 
 if __name__ == "__main__":
