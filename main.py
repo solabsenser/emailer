@@ -394,6 +394,19 @@ def main_keyboard_with_account():
     )
     return keyboard
 
+def back_keyboard():
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    keyboard.add(KeyboardButton("🔙 Назад"))
+    return keyboard
+
+def confirm_delete_keyboard():
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(
+        KeyboardButton("✅ Да"),
+        KeyboardButton("❌ Нет")
+    )
+    return keyboard
+
 async def send_bot_message(user_id, text, reply_markup=None):
     user_id = str(user_id)
     old_msg_id = bot_messages.get(user_id)
@@ -498,7 +511,7 @@ async def check_handler(message: types.Message):
             await send_bot_message(
                 user_id,
                 "📭 **Писем нет**",
-                main_keyboard_with_account()
+                back_keyboard()
             )
             return
         text = f"📩 **Письма ({len(valid_messages)}):**\n\n"
@@ -514,14 +527,27 @@ async def check_handler(message: types.Message):
         if len(valid_messages) > 10:
             text += f"... и еще {len(valid_messages)-10}\n"
         text += f"\n📌 **Всего:** {len(valid_messages)}"
-        await send_bot_message(user_id, text, main_keyboard_with_account())
+        await send_bot_message(
+            user_id,
+            text,
+            back_keyboard()
+        )
     except Exception as e:
         logger.error(f"Check error: {e}")
         await send_bot_message(
             user_id,
             f"❌ **Ошибка**\n\n{str(e)[:200]}",
-            main_keyboard_with_account()
+            back_keyboard()
         )
+
+@dp.message_handler(lambda message: message.text == "🔙 Назад")
+async def back_handler(message: types.Message):
+    user_id = str(message.from_user.id)
+    try:
+        await bot.delete_message(user_id, message.message_id)
+    except:
+        pass
+    await show_main_screen(user_id)
 
 @dp.message_handler(lambda message: message.text == "🗑 Удалить ящик")
 async def delete_handler(message: types.Message):
@@ -539,14 +565,6 @@ async def delete_handler(message: types.Message):
         f"⚠️ **Удалить ящик?**\n\n`{account['email']}`\n\nВсе письма удалятся.",
         confirm_delete_keyboard()
     )
-
-def confirm_delete_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(
-        KeyboardButton("✅ Да"),
-        KeyboardButton("❌ Нет")
-    )
-    return keyboard
 
 @dp.message_handler(lambda message: message.text == "✅ Да")
 async def confirm_delete_handler(message: types.Message):
