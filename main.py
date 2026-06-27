@@ -6,6 +6,7 @@ import aiohttp
 import re
 import email.header
 import json
+import quopri
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -104,12 +105,43 @@ def decode_header_value(value):
     except:
         return value
 
+def decode_quoted_printable(text):
+    """Декодирует quoted-printable текст в UTF-8"""
+    if not text:
+        return ''
+    try:
+        # Декодируем quoted-printable
+        decoded = quopri.decodestring(text.encode('utf-8'))
+        # Пробуем декодировать в UTF-8
+        try:
+            return decoded.decode('utf-8', errors='ignore')
+        except:
+            # Если не получилось — пробуем Windows-1251
+            try:
+                return decoded.decode('windows-1251', errors='ignore')
+            except:
+                return decoded.decode('utf-8', errors='ignore')
+    except Exception as e:
+        logger.error(f"Decode error: {e}")
+        return text
+
 def clean_body(body):
+    """Очищает и декодирует тело письма"""
     if not body:
         return ''
+    
+    # Сначала декодируем quoted-printable
+    body = decode_quoted_printable(body)
+    
+    # Убираем HTML теги
     body = re.sub(r'<[^>]+>', ' ', body)
+    
+    # Убираем множественные пробелы и переносы
     body = re.sub(r'\s+', ' ', body)
+    
+    # Убираем base64 и прочий мусор
     body = re.sub(r'[A-Za-z0-9+/=]{50,}', '', body)
+    
     return body[:500].strip()
 
 def extract_code(text):
@@ -354,6 +386,7 @@ async def check_mailcat(account):
                         if not body:
                             body = email_data.get('email', {}).get('html', '')
                         
+                        # Теперь чистим тело с декодированием
                         clean_text = clean_body(body)
                         code = extract_code(clean_text)
                         links = extract_links(clean_text)
@@ -538,7 +571,12 @@ async def show_body_callback(callback: types.CallbackQuery):
     
     msg = valid_messages[-idx]
     
+    # Получаем тело и декодируем
     body = msg.get('body', 'Нет текста')
+    # Декодируем quoted-printable если нужно
+    if '=' in body:
+        body = decode_quoted_printable(body)
+    
     # Экранируем для Markdown
     body = escape_markdown(body)
     
@@ -569,7 +607,6 @@ async def show_body_callback(callback: types.CallbackQuery):
 async def back_to_messages_callback(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
     await callback.answer()
-    # Имитируем вызов check_handler
     await check_handler(callback.message)
 
 @dp.message_handler(lambda message: message.text == "📨 Проверить почту")
@@ -718,15 +755,12 @@ async def background_check():
                 try:
                     account = user_accounts_cache.get(user_id) or await get_user(user_id)
                     if account:
-                        # ПРОВЕРЯЕМ ТИП — если не список, пересоздаём
                         if not isinstance(account.get('messages'), list):
                             logger.warning(f"⚠️ messages is {type(account.get('messages'))}, fixing for user {user_id}")
                             account['messages'] = []
-                            # Сразу сохраняем в БД
                             await save_user(user_id, account)
                             logger.info(f"✅ Fixed messages for user {user_id}")
                         
-                        # Теперь точно работаем со списком
                         new = await check_mailcat(account)
                         if new:
                             account['messages'].extend(new)
