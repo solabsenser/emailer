@@ -24,13 +24,14 @@ PORT = int(os.getenv("PORT", 10000))
 # ===== ХРАНИЛИЩЕ =====
 mailboxes = {}
 user_emails = defaultdict(list)
+user_last_message = {}
 
 def generate_email():
     alphabet = string.ascii_lowercase + string.digits
     local = ''.join(secrets.choice(alphabet) for _ in range(8))
     return f"{local}@{DOMAIN}"
 
-# ===== SMTP =====
+# ===== SMTP С ПОДДЕРЖКОЙ HTTP HEAD =====
 class MailHandler:
     async def handle_DATA(self, server, session, envelope):
         try:
@@ -66,8 +67,16 @@ class MailHandler:
             logging.error(f"SMTP error: {e}")
             return '550 Error'
 
+class CustomMailHandler(MailHandler):
+    """Обработчик, игнорирующий HTTP-запросы"""
+    async def handle_DATA(self, server, session, envelope):
+        # Если это не SMTP-запрос
+        if not envelope or not envelope.rcpt_tos:
+            return '500 Ignored'
+        return await super().handle_DATA(server, session, envelope)
+
 def start_smtp():
-    handler = MailHandler()
+    handler = CustomMailHandler()
     controller = Controller(handler, hostname='0.0.0.0', port=2525)
     controller.start()
     return controller
@@ -78,6 +87,7 @@ async def health_check(request):
 
 async def start_web():
     app = web.Application()
+    app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -99,11 +109,8 @@ def get_main_menu():
     )
     return keyboard
 
-# Храним ID последнего сообщения для каждого пользователя
-user_last_message = {}
-
 async def update_message(user_id, text, reply_markup=None, parse_mode='Markdown'):
-    """Редактирует последнее сообщение пользователя или отправляет новое если его нет"""
+    """Редактирует последнее сообщение пользователя"""
     msg_id = user_last_message.get(user_id)
     
     try:
@@ -124,8 +131,7 @@ async def update_message(user_id, text, reply_markup=None, parse_mode='Markdown'
             )
             user_last_message[user_id] = sent.message_id
     except Exception as e:
-        # Если не удалось отредактировать (сообщение старое) - отправляем новое
-        if "message to edit not found" in str(e) or "message is not modified" in str(e):
+        if "message to edit not found" in str(e):
             sent = await bot.send_message(
                 user_id,
                 text,
@@ -133,6 +139,8 @@ async def update_message(user_id, text, reply_markup=None, parse_mode='Markdown'
                 reply_markup=reply_markup
             )
             user_last_message[user_id] = sent.message_id
+        elif "message is not modified" in str(e):
+            pass
         else:
             logging.error(f"Update error: {e}")
 
@@ -168,7 +176,7 @@ async def create(callback: types.CallbackQuery):
     if len(user_emails[str(user_id)]) >= 10:
         await update_message(
             user_id,
-            "❌ **Максимум 10 ящиков**\n\nУдалите один из существующих",
+            "❌ **Максимум 10 ящиков**",
             reply_markup=get_main_menu()
         )
         return
@@ -182,15 +190,14 @@ async def create(callback: types.CallbackQuery):
             await update_message(
                 user_id,
                 f"✅ **Создан email:**\n`{email}`\n\n"
-                f"📩 Отправляйте письма на этот адрес\n"
-                f"🗑 Удалить можно через меню",
+                f"📩 Отправляйте письма на этот адрес",
                 reply_markup=get_main_menu()
             )
             return
     
     await update_message(
         user_id,
-        "❌ **Ошибка создания**\nПопробуйте снова",
+        "❌ **Ошибка создания**",
         reply_markup=get_main_menu()
     )
 
@@ -204,7 +211,7 @@ async def list_emails(callback: types.CallbackQuery):
     if not emails:
         await update_message(
             user_id,
-            "📭 **У вас нет ящиков**\n\nНажмите «Создать почту»",
+            "📭 **У вас нет ящиков**",
             reply_markup=get_main_menu()
         )
         return
@@ -226,7 +233,7 @@ async def check(callback: types.CallbackQuery):
     if not emails:
         await update_message(
             user_id,
-            "📭 **Нет ящиков**\n\nНажмите «Создать почту»",
+            "📭 **Нет ящиков**",
             reply_markup=get_main_menu()
         )
         return
@@ -242,7 +249,7 @@ async def check(callback: types.CallbackQuery):
     
     await update_message(
         user_id,
-        "📨 **Выберите ящик для просмотра:**",
+        "📨 **Выберите ящик:**",
         reply_markup=keyboard
     )
 
@@ -303,7 +310,7 @@ async def delete_menu(callback: types.CallbackQuery):
     if not emails:
         await update_message(
             user_id,
-            "📭 **Нет ящиков для удаления**",
+            "📭 **Нет ящиков**",
             reply_markup=get_main_menu()
         )
         return
@@ -319,8 +326,7 @@ async def delete_menu(callback: types.CallbackQuery):
     
     await update_message(
         user_id,
-        "⚠️ **Выберите ящик для удаления:**\n\n"
-        "Ящик и все письма будут удалены безвозвратно",
+        "⚠️ **Выберите ящик для удаления:**",
         reply_markup=keyboard
     )
 
@@ -353,17 +359,20 @@ async def back_to_menu(callback: types.CallbackQuery):
     
     await update_message(
         user_id,
-        "📧 **Главное меню**\n\nВыберите действие:",
+        "📧 **Главное меню**",
         reply_markup=get_main_menu()
     )
 
 # ===== ЗАПУСК =====
 async def main():
+    # Запускаем SMTP
     smtp = start_smtp()
     logging.info("✅ SMTP сервер запущен на порту 2525")
     
+    # Запускаем Web
     await start_web()
     
+    # Запускаем бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
