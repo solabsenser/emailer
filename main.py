@@ -5,6 +5,8 @@ import string
 import aiohttp
 import re
 import email.header
+import sqlite3
+import json
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -19,10 +21,172 @@ logger = logging.getLogger(__name__)
 # ===== КОНФИГ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
+DB_PATH = os.getenv("DB_PATH", "data.db")
 
-# ===== ХРАНИЛИЩЕ =====
-user_accounts = {}
-bot_messages = {}  # {user_id: message_id} - ID последнего сообщения бота
+# ===== БАЗА ДАННЫХ =====
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Таблица пользователей и их ящиков
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            email TEXT,
+            token TEXT,
+            account_id TEXT,
+            messages TEXT DEFAULT '[]',
+            read_ids TEXT DEFAULT '[]',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    logger.info("✅ Database initialized")
+
+def get_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT email, token, account_id, messages, read_ids FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        return {
+            'email': row[0],
+            'token': row[1],
+            'account_id': row[2],
+            'messages': json.loads(row[3]) if row[3] else [],
+            'read_ids': json.loads(row[4]) if row[4] else []
+        }
+    return None
+
+def save_user(user_id, account):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO users (user_id, email, token, account_id, messages, read_ids)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (
+        user_id,
+        account['email'],
+        account['token'],
+        account.get('account_id', ''),
+        json.dumps(account.get('messages', [])),
+        json.dumps(account.get('read_ids', []))
+    ))
+    conn.commit()
+    conn.close()
+
+def delete_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def update_messages(user_id, messages, read_ids):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE users SET messages = ?, read_ids = ? WHERE user_id = ?
+    ''', (json.dumps(messages), json.dumps(read_ids), user_id))
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM users')
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+# ===== ХРАНИЛИЩЕ (кэш в памяти) =====
+user_accounts_cache = {}  # {user_id: account_dict}
+bot_messages = {}  # {user_id: message_id}
+
+def load_all_users_to_cache():
+    """Загружает всех пользователей из БД в память при старте"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, email, token, account_id, messages, read_ids FROM users')
+    rows = cursor.fetchall()
+    conn.close()
+    
+    for row in rows:
+        user_id = row[0]
+        user_accounts_cache[user_id] = {
+            'email': row[1],
+            'token': row[2],
+            'account_id': row[3],
+            'messages': json.loads(row[4]) if row[4] else [],
+            'read_ids': json.loads(row[5]) if row[5] else []
+        }
+    
+    if rows:
+        logger.info(f"✅ Loaded {len(rows)} users from database")
+
+# ===== MAILCAT API =====
+MAILCAT_API = "https://api.mailcat.ai"
+
+async def create_mailcat_mailbox():
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{MAILCAT_API}/mailboxes") as resp:
+            if resp.status not in [200, 201]:
+                error_text = await resp.text()
+                raise Exception(f"Failed: {resp.status} - {error_text}")
+            data = await resp.json()
+            mailbox = data.get('data', {})
+            email = mailbox.get('email')
+            token = mailbox.get('token')
+            if not email or not token:
+                raise Exception(f"Invalid response: {data}")
+            return {
+                'email': email,
+                'token': token,
+                'account_id': '',
+                'messages': [],
+                'read_ids': []
+            }
+
+async def check_mailcat(account):
+    async with aiohttp.ClientSession() as session:
+        headers = {"Authorization": f"Bearer {account['token']}"}
+        async with session.get(f"{MAILCAT_API}/inbox", headers=headers) as resp:
+            if resp.status not in [200, 201]:
+                return []
+            data = await resp.json()
+            messages = data.get('data', [])
+        new_messages = []
+        for msg in messages:
+            msg_id = msg.get('id')
+            if msg_id not in account.get('read_ids', []):
+                account.setdefault('read_ids', []).append(msg_id)
+                async with session.get(f"{MAILCAT_API}/emails/{msg_id}", headers=headers) as resp2:
+                    if resp2.status in [200, 201]:
+                        full = await resp2.json()
+                        email_data = full.get('data', {})
+                        raw_subject = email_data.get('email', {}).get('subject', '(no subject)')
+                        subject = decode_header_value(raw_subject)
+                        raw_from = email_data.get('email', {}).get('from', 'unknown')
+                        sender = decode_header_value(raw_from)
+                        body = email_data.get('email', {}).get('text', '')
+                        if not body:
+                            body = email_data.get('email', {}).get('html', '')
+                            body = re.sub(r'<[^>]+>', '', body)
+                        code = extract_code(body) or email_data.get('code', '')
+                        links = extract_links(body)
+                        new_messages.append({
+                            'sender': sender,
+                            'subject': subject,
+                            'body': body[:5000],
+                            'code': code,
+                            'links': links[:5],
+                            'received_at': datetime.now().isoformat()
+                        })
+        return new_messages
 
 def decode_header_value(value):
     if not value:
@@ -73,65 +237,6 @@ def extract_code(text):
                 return code
     return None
 
-# ===== MAILCAT API =====
-MAILCAT_API = "https://api.mailcat.ai"
-
-async def create_mailcat_mailbox():
-    async with aiohttp.ClientSession() as session:
-        async with session.post(f"{MAILCAT_API}/mailboxes") as resp:
-            if resp.status not in [200, 201]:
-                error_text = await resp.text()
-                raise Exception(f"Failed: {resp.status} - {error_text}")
-            data = await resp.json()
-            mailbox = data.get('data', {})
-            email = mailbox.get('email')
-            token = mailbox.get('token')
-            if not email or not token:
-                raise Exception(f"Invalid response: {data}")
-            return {
-                'email': email,
-                'token': token,
-                'messages': [],
-                'read_ids': []
-            }
-
-async def check_mailcat(account):
-    async with aiohttp.ClientSession() as session:
-        headers = {"Authorization": f"Bearer {account['token']}"}
-        async with session.get(f"{MAILCAT_API}/inbox", headers=headers) as resp:
-            if resp.status not in [200, 201]:
-                return []
-            data = await resp.json()
-            messages = data.get('data', [])
-        new_messages = []
-        for msg in messages:
-            msg_id = msg.get('id')
-            if msg_id not in account.get('read_ids', []):
-                account.setdefault('read_ids', []).append(msg_id)
-                async with session.get(f"{MAILCAT_API}/emails/{msg_id}", headers=headers) as resp2:
-                    if resp2.status in [200, 201]:
-                        full = await resp2.json()
-                        email_data = full.get('data', {})
-                        raw_subject = email_data.get('email', {}).get('subject', '(no subject)')
-                        subject = decode_header_value(raw_subject)
-                        raw_from = email_data.get('email', {}).get('from', 'unknown')
-                        sender = decode_header_value(raw_from)
-                        body = email_data.get('email', {}).get('text', '')
-                        if not body:
-                            body = email_data.get('email', {}).get('html', '')
-                            body = re.sub(r'<[^>]+>', '', body)
-                        code = extract_code(body) or email_data.get('code', '')
-                        links = extract_links(body)
-                        new_messages.append({
-                            'sender': sender,
-                            'subject': subject,
-                            'body': body[:5000],
-                            'code': code,
-                            'links': links[:5],
-                            'received_at': datetime.now()
-                        })
-        return new_messages
-
 # ===== WEB СЕРВЕР =====
 async def health_check(request):
     return web.Response(text="OK", status=200)
@@ -150,7 +255,7 @@ async def start_web():
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# ===== REPLY-КЛАВИАТУРЫ =====
+# ===== КЛАВИАТУРЫ =====
 def main_keyboard_no_account():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
     keyboard.add(KeyboardButton("📧 Создать почту"))
@@ -178,8 +283,6 @@ def confirm_delete_keyboard():
     return keyboard
 
 async def send_bot_message(user_id, text, reply_markup=None):
-    """Отправляет сообщение от бота, удаляя предыдущее сообщение бота"""
-    # Удаляем предыдущее сообщение бота
     old_msg_id = bot_messages.get(user_id)
     if old_msg_id:
         try:
@@ -188,7 +291,6 @@ async def send_bot_message(user_id, text, reply_markup=None):
             pass
         bot_messages.pop(user_id, None)
     
-    # Отправляем новое
     try:
         sent = await bot.send_message(
             user_id,
@@ -203,7 +305,12 @@ async def send_bot_message(user_id, text, reply_markup=None):
         return None
 
 async def show_main_screen(user_id):
-    account = user_accounts.get(str(user_id))
+    # Пытаемся получить из кэша, если нет — из БД
+    account = user_accounts_cache.get(str(user_id))
+    if not account:
+        account = get_user(str(user_id))
+        if account:
+            user_accounts_cache[str(user_id)] = account
     
     if not account:
         await send_bot_message(
@@ -230,42 +337,35 @@ async def show_main_screen(user_id):
         main_keyboard_with_account()
     )
 
-# ===== /start ОСТАЁТСЯ В ЧАТЕ =====
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
-    user_id = message.from_user.id
-    # НЕ удаляем /start, просто показываем меню
+    user_id = str(message.from_user.id)
+    account = user_accounts_cache.get(user_id) or get_user(user_id)
     await send_bot_message(
         user_id,
         "👋 **Добро пожаловать!**\n\n"
         "📧 Временная почта\n"
-        "Создайте email для регистрации\n"
-        "Письма приходят автоматически",
-        main_keyboard_no_account() if str(user_id) not in user_accounts else main_keyboard_with_account()
+        "Создайте email для регистрации",
+        main_keyboard_with_account() if account else main_keyboard_no_account()
     )
-
-@dp.message_handler(commands=['menu'])
-async def menu(message: types.Message):
-    user_id = message.from_user.id
-    await show_main_screen(user_id)
 
 @dp.message_handler(lambda message: message.text == "📧 Создать почту")
 async def create_handler(message: types.Message):
-    user_id = message.from_user.id
+    user_id = str(message.from_user.id)
     
-    # Удаляем сообщение пользователя
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
     
-    if str(user_id) in user_accounts:
+    if user_id in user_accounts_cache:
         await show_main_screen(user_id)
         return
     
     try:
         account = await create_mailcat_mailbox()
-        user_accounts[str(user_id)] = account
+        user_accounts_cache[user_id] = account
+        save_user(user_id, account)
         await show_main_screen(user_id)
     except Exception as e:
         logger.error(f"Create error: {e}")
@@ -277,15 +377,14 @@ async def create_handler(message: types.Message):
 
 @dp.message_handler(lambda message: message.text == "📨 Проверить почту")
 async def check_handler(message: types.Message):
-    user_id = message.from_user.id
+    user_id = str(message.from_user.id)
     
-    # Удаляем сообщение пользователя
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
     
-    account = user_accounts.get(str(user_id))
+    account = user_accounts_cache.get(user_id) or get_user(user_id)
     if not account:
         await show_main_screen(user_id)
         return
@@ -296,19 +395,21 @@ async def check_handler(message: types.Message):
         new = await check_mailcat(account)
         if new:
             account.setdefault('messages', []).extend(new)
+            # Сохраняем в БД
+            save_user(user_id, account)
         
         messages = account.get('messages', [])
         if not messages:
             await send_bot_message(
                 user_id,
-                "📭 **Писем нет**\n\nНажмите «Назад» для возврата",
+                "📭 **Писем нет**\n\nНажмите «Назад»",
                 back_keyboard()
             )
             return
         
         text = f"📩 **Письма ({len(messages)}):**\n\n"
         for i, msg in enumerate(messages[-10:][::-1], 1):
-            time = msg['received_at'].strftime('%H:%M')
+            time = datetime.fromisoformat(msg['received_at']).strftime('%H:%M')
             text += f"{i}. [{time}] **{msg['subject'][:35]}**\n"
             text += f"   От: {msg['sender'][:30]}\n"
             if msg.get('code'):
@@ -335,15 +436,14 @@ async def check_handler(message: types.Message):
 
 @dp.message_handler(lambda message: message.text == "🗑 Удалить ящик")
 async def delete_handler(message: types.Message):
-    user_id = message.from_user.id
+    user_id = str(message.from_user.id)
     
-    # Удаляем сообщение пользователя
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
     
-    account = user_accounts.get(str(user_id))
+    account = user_accounts_cache.get(user_id) or get_user(user_id)
     if not account:
         await show_main_screen(user_id)
         return
@@ -358,15 +458,14 @@ async def delete_handler(message: types.Message):
 
 @dp.message_handler(lambda message: message.text == "✅ Да, удалить")
 async def confirm_delete_handler(message: types.Message):
-    user_id = message.from_user.id
+    user_id = str(message.from_user.id)
     
-    # Удаляем сообщение пользователя
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
     
-    account = user_accounts.get(str(user_id))
+    account = user_accounts_cache.get(user_id) or get_user(user_id)
     if not account:
         await show_main_screen(user_id)
         return
@@ -378,7 +477,8 @@ async def confirm_delete_handler(message: types.Message):
     except:
         pass
     
-    del user_accounts[str(user_id)]
+    user_accounts_cache.pop(user_id, None)
+    delete_user(user_id)
     
     await send_bot_message(
         user_id,
@@ -388,32 +488,25 @@ async def confirm_delete_handler(message: types.Message):
 
 @dp.message_handler(lambda message: message.text == "❌ Отмена")
 async def cancel_delete_handler(message: types.Message):
-    user_id = message.from_user.id
-    
-    # Удаляем сообщение пользователя
+    user_id = str(message.from_user.id)
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
-    
     await show_main_screen(user_id)
 
 @dp.message_handler(lambda message: message.text == "🔙 Назад")
 async def back_handler(message: types.Message):
-    user_id = message.from_user.id
-    
-    # Удаляем сообщение пользователя
+    user_id = str(message.from_user.id)
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
         pass
-    
     await show_main_screen(user_id)
 
 @dp.message_handler()
 async def any_message(message: types.Message):
-    user_id = message.from_user.id
-    # Удаляем всё, что не обработано
+    user_id = str(message.from_user.id)
     try:
         await bot.delete_message(user_id, message.message_id)
     except:
@@ -423,30 +516,40 @@ async def any_message(message: types.Message):
 async def background_check():
     while True:
         try:
-            for user_id, account in list(user_accounts.items()):
-                try:
-                    new = await check_mailcat(account)
-                    if new:
-                        account.setdefault('messages', []).extend(new)
-                        msg = new[0]
-                        text = f"📨 **Новое письмо!**\n\n"
-                        text += f"От: {msg['sender'][:35]}\n"
-                        text += f"Тема: {msg['subject'][:40]}\n"
-                        if msg.get('code'):
-                            text += f"🔑 Код: `{msg['code']}`\n"
-                        if msg.get('links'):
-                            text += f"🔗 {msg['links'][0][:60]}"
-                        await bot.send_message(int(user_id), text, parse_mode='Markdown')
-                except:
-                    pass
+            for user_id in get_all_users():
+                account = user_accounts_cache.get(user_id) or get_user(user_id)
+                if account:
+                    try:
+                        new = await check_mailcat(account)
+                        if new:
+                            account.setdefault('messages', []).extend(new)
+                            save_user(user_id, account)
+                            msg = new[0]
+                            text = f"📨 **Новое письмо!**\n\n"
+                            text += f"От: {msg['sender'][:35]}\n"
+                            text += f"Тема: {msg['subject'][:40]}\n"
+                            if msg.get('code'):
+                                text += f"🔑 Код: `{msg['code']}`\n"
+                            if msg.get('links'):
+                                text += f"🔗 {msg['links'][0][:60]}"
+                            await bot.send_message(int(user_id), text, parse_mode='Markdown')
+                    except:
+                        pass
         except:
             pass
         await asyncio.sleep(30)
 
 async def main():
+    # Инициализация БД
+    init_db()
+    
+    # Загружаем всех пользователей в кэш
+    load_all_users_to_cache()
+    
     await start_web()
     asyncio.create_task(background_check())
     await bot.delete_webhook(drop_pending_updates=True)
+    
     while True:
         try:
             await dp.start_polling(bot)
