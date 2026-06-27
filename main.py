@@ -6,16 +6,16 @@ from datetime import datetime
 from collections import defaultdict
 from email import message_from_bytes
 from email.policy import default
-from aiosmtpd.controller import Controller
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
 from dotenv import load_dotenv
 import os
 
-# Отключаем логи SMTP
-logging.getLogger('mail').setLevel(logging.WARNING)
-logging.getLogger('aiosmtpd').setLevel(logging.WARNING)
+# Полностью отключаем логи SMTP
+logging.getLogger('mail').setLevel(logging.ERROR)
+logging.getLogger('aiosmtpd').setLevel(logging.ERROR)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -36,48 +36,54 @@ def generate_email():
     local = ''.join(secrets.choice(alphabet) for _ in range(8))
     return f"{local}@{DOMAIN}"
 
-# ===== SMTP СЕРВЕР (тихий режим) =====
-class MailHandler:
-    async def handle_DATA(self, server, session, envelope):
-        try:
-            if not envelope or not envelope.rcpt_tos:
-                return '500 Ignored'
-            
-            recipient = envelope.rcpt_tos[0]
-            if recipient not in mailboxes:
-                return f'550 Mailbox {recipient} not found'
-            
-            msg = message_from_bytes(envelope.content, policy=default)
-            subject = msg.get('Subject', '(no subject)')
-            sender = msg.get('From', 'unknown')
-            
-            body = ''
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == 'text/plain':
-                        body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        break
-            else:
-                payload = msg.get_payload(decode=True)
-                if payload:
-                    body = payload.decode('utf-8', errors='ignore')
-            
-            mailboxes[recipient].setdefault('messages', []).append({
-                'sender': sender,
-                'subject': subject,
-                'body': body[:5000],
-                'received_at': datetime.utcnow()
-            })
-            
-            return '250 OK'
-        except Exception:
-            return '550 Error'
-
+# ===== SMTP (запускается в отдельном потоке, тихо) =====
 def start_smtp():
-    handler = MailHandler()
-    controller = Controller(handler, hostname='127.0.0.1', port=2525)
-    controller.start()
-    return controller
+    try:
+        from aiosmtpd.controller import Controller
+        
+        class MailHandler:
+            async def handle_DATA(self, server, session, envelope):
+                try:
+                    if not envelope or not envelope.rcpt_tos:
+                        return '500 Ignored'
+                    
+                    recipient = envelope.rcpt_tos[0]
+                    if recipient not in mailboxes:
+                        return f'550 Mailbox {recipient} not found'
+                    
+                    msg = message_from_bytes(envelope.content, policy=default)
+                    subject = msg.get('Subject', '(no subject)')
+                    sender = msg.get('From', 'unknown')
+                    
+                    body = ''
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            if part.get_content_type() == 'text/plain':
+                                body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                break
+                    else:
+                        payload = msg.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode('utf-8', errors='ignore')
+                    
+                    mailboxes[recipient].setdefault('messages', []).append({
+                        'sender': sender,
+                        'subject': subject,
+                        'body': body[:5000],
+                        'received_at': datetime.utcnow()
+                    })
+                    
+                    return '250 OK'
+                except Exception:
+                    return '550 Error'
+        
+        controller = Controller(MailHandler(), hostname='127.0.0.1', port=2525)
+        controller.start()
+        logger.info("✅ SMTP server running on 127.0.0.1:2525")
+        return controller
+    except Exception as e:
+        logger.warning(f"SMTP not started: {e}")
+        return None
 
 # ===== WEB СЕРВЕР =====
 async def health_check(request):
@@ -287,19 +293,30 @@ async def handle_callbacks(callback: types.CallbackQuery):
     elif data == "back_to_menu":
         await safe_edit(user_id, "📧 **Главное меню**", get_main_menu())
 
-# ===== ЗАПУСК =====
+# ===== ЗАПУСК С ПЕРЕЗАПУСКОМ ПРИ КОНФЛИКТЕ =====
+async def start_bot_with_retry():
+    """Запускает бота с обработкой конфликта"""
+    while True:
+        try:
+            logger.info("🚀 Starting bot...")
+            await dp.start_polling(bot)
+            break
+        except TerminatedByOtherGetUpdates:
+            logger.warning("⚠️ Conflict detected, waiting 5 seconds and retrying...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Bot error: {e}")
+            await asyncio.sleep(5)
+
 async def main():
-    # SMTP (тихо)
+    # Запускаем SMTP (тихо)
     smtp = start_smtp()
     
-    # Web
+    # Запускаем Web
     await start_web()
     
-    # Бот
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Bot error: {e}")
+    # Запускаем бота с автоматическим перезапуском
+    await start_bot_with_retry()
 
 if __name__ == "__main__":
     asyncio.run(main())
