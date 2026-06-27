@@ -25,7 +25,6 @@ user_accounts = {}
 user_messages = {}
 
 def decode_header_value(value):
-    """Декодирует заголовки письма (типа =?UTF-8?Q?...)"""
     if not value:
         return ''
     try:
@@ -45,7 +44,6 @@ def decode_header_value(value):
         return value
 
 def extract_links(text):
-    """Находит все URL-ссылки в тексте"""
     if not text:
         return []
     url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
@@ -58,18 +56,15 @@ def extract_links(text):
     return clean_links
 
 def extract_code(text):
-    """Пытается найти код подтверждения в тексте"""
     if not text:
         return None
-    
-    # Паттерны для кодов: 6 цифр, 4-8 букв/цифр, и т.д.
     patterns = [
-        r'\b\d{4,8}\b',          # 4-8 цифр
-        r'\b[A-Z0-9]{4,8}\b',     # 4-8 символов (заглавные + цифры)
-        r'код[:\s]*([A-Z0-9]{4,8})',  # "код: 123456"
-        r'verification code[:\s]*([A-Z0-9]{4,8})',  # "verification code: 123456"
+        r'\b\d{4,8}\b',
+        r'\b[A-Z0-9]{4,8}\b',
+        r'код[:\s]*([A-Z0-9]{4,8})',
+        r'verification code[:\s]*([A-Z0-9]{4,8})',
+        r'код подтверждения[:\s]*([A-Z0-9]{4,8})',
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
@@ -87,16 +82,12 @@ async def create_mailcat_mailbox():
             if resp.status not in [200, 201]:
                 error_text = await resp.text()
                 raise Exception(f"Failed: {resp.status} - {error_text}")
-            
             data = await resp.json()
             mailbox = data.get('data', {})
-            
             email = mailbox.get('email')
             token = mailbox.get('token')
-            
             if not email or not token:
                 raise Exception(f"Invalid response: {data}")
-            
             return {
                 'email': email,
                 'token': token,
@@ -107,50 +98,38 @@ async def create_mailcat_mailbox():
 async def check_mailcat(account):
     async with aiohttp.ClientSession() as session:
         headers = {"Authorization": f"Bearer {account['token']}"}
-        
         async with session.get(f"{MAILCAT_API}/inbox", headers=headers) as resp:
             if resp.status not in [200, 201]:
                 return []
             data = await resp.json()
             messages = data.get('data', [])
-        
         new_messages = []
         for msg in messages:
             msg_id = msg.get('id')
             if msg_id not in account.get('read_ids', []):
                 account.setdefault('read_ids', []).append(msg_id)
-                
                 async with session.get(f"{MAILCAT_API}/emails/{msg_id}", headers=headers) as resp2:
                     if resp2.status in [200, 201]:
                         full = await resp2.json()
                         email_data = full.get('data', {})
-                        
-                        # Декодируем тему и отправителя
                         raw_subject = email_data.get('email', {}).get('subject', '(no subject)')
                         subject = decode_header_value(raw_subject)
-                        
                         raw_from = email_data.get('email', {}).get('from', 'unknown')
                         sender = decode_header_value(raw_from)
-                        
-                        # Получаем тело письма
                         body = email_data.get('email', {}).get('text', '')
                         if not body:
                             body = email_data.get('email', {}).get('html', '')
                             body = re.sub(r'<[^>]+>', '', body)
-                        
-                        # Извлекаем код и ссылки
                         code = extract_code(body) or email_data.get('code', '')
                         links = extract_links(body)
-                        
                         new_messages.append({
                             'sender': sender,
                             'subject': subject,
                             'body': body[:5000],
                             'code': code,
-                            'links': links[:5],  # максимум 5 ссылок
+                            'links': links[:5],
                             'received_at': datetime.now()
                         })
-        
         return new_messages
 
 # ===== WEB СЕРВЕР =====
@@ -182,15 +161,38 @@ def get_main_menu():
     return keyboard
 
 async def update_or_send(user_id, text, reply_markup=None):
+    """Гарантированно редактирует ОДНО сообщение"""
     msg_id = user_messages.get(user_id)
+    
     if msg_id:
         try:
-            await bot.edit_message_text(text, chat_id=user_id, message_id=msg_id, parse_mode='Markdown', reply_markup=reply_markup)
+            await bot.edit_message_text(
+                text,
+                chat_id=user_id,
+                message_id=msg_id,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
             return
-        except:
-            user_messages.pop(user_id, None)
-    sent = await bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=reply_markup)
-    user_messages[user_id] = sent.message_id
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+            if "message to edit not found" in str(e).lower():
+                user_messages.pop(user_id, None)
+            else:
+                logger.error(f"Edit error: {e}")
+                user_messages.pop(user_id, None)
+    
+    try:
+        sent = await bot.send_message(
+            user_id,
+            text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+        user_messages[user_id] = sent.message_id
+    except Exception as e:
+        logger.error(f"Send error: {e}")
 
 @dp.message_handler(commands=['start', 'menu'])
 async def start(message: types.Message):
@@ -205,15 +207,19 @@ async def start(message: types.Message):
         get_main_menu()
     )
 
+@dp.message_handler()
+async def any_message(message: types.Message):
+    user_id = message.from_user.id
+    user_messages[user_id] = message.message_id
+    await update_or_send(user_id, "📧 Используйте кнопки:", get_main_menu())
+
 @dp.callback_query_handler(lambda c: c.data == "create")
 async def create_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
-    
     if str(user_id) in user_accounts:
         await update_or_send(user_id, "❌ **У вас уже есть ящик**", get_main_menu())
         return
-    
     try:
         account = await create_mailcat_mailbox()
         user_accounts[str(user_id)] = account
@@ -235,7 +241,12 @@ async def list_callback(callback: types.CallbackQuery):
     if not account:
         await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
         return
-    await update_or_send(user_id, f"📬 **Ваш ящик:**\n`{account['email']}`\n\n📨 Писем: {len(account.get('messages', []))}", get_main_menu())
+    msg_count = len(account.get('messages', []))
+    await update_or_send(
+        user_id,
+        f"📬 **Ваш ящик:**\n`{account['email']}`\n\n📨 Писем: {msg_count}",
+        get_main_menu()
+    )
 
 @dp.callback_query_handler(lambda c: c.data == "check")
 async def check_callback(callback: types.CallbackQuery):
@@ -245,30 +256,22 @@ async def check_callback(callback: types.CallbackQuery):
     if not account:
         await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
         return
-    
     await update_or_send(user_id, "🔄 **Проверяю...**", get_main_menu())
     try:
         new = await check_mailcat(account)
         if new:
             account.setdefault('messages', []).extend(new)
-            
-            # Формируем сообщение с кодами и ссылками
             codes = [msg.get('code') for msg in new if msg.get('code')]
             links = []
             for msg in new:
                 links.extend(msg.get('links', []))
-            
             response = f"✅ **{len(new)} новых писем!**\n"
-            
             if codes:
                 response += "\n🔑 **Коды:**\n" + "\n".join([f"• `{c}`" for c in codes[:5]])
-            
             if links:
                 response += "\n\n🔗 **Ссылки:**\n" + "\n".join([f"• {link[:60]}..." if len(link) > 60 else f"• {link}" for link in links[:5]])
-            
             if not codes and not links:
                 response += "\n\n📝 Нажмите «Мои ящики» для просмотра"
-            
             await update_or_send(user_id, response, get_main_menu())
         else:
             total = len(account.get('messages', []))
@@ -284,12 +287,10 @@ async def view_callback(callback: types.CallbackQuery):
     if not account:
         await update_or_send(user_id, "❌ **Нет ящика**", get_main_menu())
         return
-    
     messages = account.get('messages', [])
     if not messages:
         await update_or_send(user_id, "📭 **Нет писем**", get_main_menu())
         return
-    
     text = f"📩 **Письма:**\n\n"
     for i, msg in enumerate(messages[-10:][::-1], 1):
         text += f"{i}. **{msg['subject'][:40]}**\n"
@@ -300,9 +301,7 @@ async def view_callback(callback: types.CallbackQuery):
             for link in msg['links'][:2]:
                 text += f"   🔗 {link[:50]}...\n"
         text += "\n"
-    
     text += f"\n📌 **Всего:** {len(messages)}"
-    
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         InlineKeyboardButton("🔙 Назад", callback_data="check"),
@@ -318,7 +317,6 @@ async def delete_callback(callback: types.CallbackQuery):
     if not account:
         await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
         return
-    
     del user_accounts[str(user_id)]
     await update_or_send(user_id, f"🗑 **Ящик удалён**", get_main_menu())
 
@@ -336,15 +334,11 @@ async def background_check():
                     new = await check_mailcat(account)
                     if new:
                         account.setdefault('messages', []).extend(new)
-                        
                         msg_text = f"📨 **Новое письмо!**\nОт: {new[0]['sender'][:35]}\nТема: {new[0]['subject'][:40]}"
-                        
                         if new[0].get('code'):
                             msg_text += f"\n🔑 Код: `{new[0]['code']}`"
-                        
                         if new[0].get('links'):
                             msg_text += f"\n🔗 {new[0]['links'][0][:60]}..."
-                        
                         await bot.send_message(int(user_id), msg_text, parse_mode='Markdown')
                 except:
                     pass
