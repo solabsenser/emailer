@@ -106,7 +106,6 @@ def decode_header_value(value):
         return value
 
 def decode_quoted_printable(text):
-    """Декодирует quoted-printable текст"""
     if not text:
         return ''
     try:
@@ -114,6 +113,20 @@ def decode_quoted_printable(text):
         return decoded.decode('utf-8', errors='ignore')
     except:
         return text
+
+def extract_links_from_html(html):
+    """Извлекает все ссылки из HTML"""
+    if not html:
+        return []
+    hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', html, re.IGNORECASE)
+    urls = re.findall(r'https?://[^\s<>"]+', html)
+    all_links = hrefs + urls
+    clean = []
+    for link in all_links:
+        link = link.strip('.,;:!?()[]{}"\'')
+        if link.startswith('http') or link.startswith('www'):
+            clean.append(link)
+    return clean[:5]
 
 def extract_code(text):
     if not text:
@@ -353,26 +366,34 @@ async def check_mailcat(account):
                         raw_from = email_data.get('email', {}).get('from', 'unknown')
                         sender = decode_header_value(raw_from)
                         
-                        # Получаем тело
-                        body = email_data.get('email', {}).get('html', '') or email_data.get('email', {}).get('text', '')
+                        html = email_data.get('email', {}).get('html', '')
+                        text = email_data.get('email', {}).get('text', '')
                         
-                        # ДЕКОДИРУЕМ quoted-printable
-                        body = decode_quoted_printable(body)
+                        # ИЗВЛЕКАЕМ ССЫЛКИ ИЗ HTML
+                        html_links = extract_links_from_html(html)
                         
-                        # Убираем HTML теги
-                        body = re.sub(r'<[^>]+>', ' ', body)
-                        body = re.sub(r'\s+', ' ', body)
-                        body = body[:500].strip()
+                        # Текст без HTML
+                        clean_text = re.sub(r'<[^>]+>', ' ', html)
+                        clean_text = re.sub(r'\s+', ' ', clean_text)
+                        clean_text = clean_text[:500].strip()
                         
-                        code = extract_code(body)
-                        links = extract_links(body)
+                        # Ищем код
+                        code = extract_code(clean_text)
+                        
+                        # Объединяем ссылки
+                        all_links = html_links + extract_links(clean_text)
+                        # Убираем дубли
+                        unique_links = []
+                        for link in all_links:
+                            if link not in unique_links:
+                                unique_links.append(link)
                         
                         new_messages.append({
                             'sender': sender,
                             'subject': subject,
-                            'body': body,
+                            'body': clean_text,
                             'code': code,
-                            'links': links[:3],
+                            'links': unique_links[:5],
                             'received_at': datetime.now().isoformat()
                         })
         return new_messages
@@ -547,9 +568,7 @@ async def show_body_callback(callback: types.CallbackQuery):
     
     msg = valid_messages[-idx]
     
-    # Получаем тело и декодируем
     body = msg.get('body', 'Нет текста')
-    body = decode_quoted_printable(body)
     body = escape_markdown(body)
     
     text = f"📄 **Полный текст письма**\n\n"
@@ -560,6 +579,12 @@ async def show_body_callback(callback: types.CallbackQuery):
     
     if len(body) > 1000:
         text += f"\n\n... (текст обрезан, всего символов: {len(body)})"
+    
+    # Добавляем ссылки если есть
+    if msg.get('links'):
+        text += f"\n\n🔗 **Ссылки:**\n"
+        for link in msg['links'][:3]:
+            text += f"• {link}\n"
     
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(InlineKeyboardButton("🔙 Назад к письмам", callback_data="back_to_messages"))
