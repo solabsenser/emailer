@@ -102,12 +102,27 @@ def decode_header_value(value):
         return value
 
 def decode_quoted_printable(text):
+    """Декодирует quoted-printable и убирает экранирование"""
     if not text:
         return ''
     try:
+        # Убираем экранирование обратных слэшей
+        text = text.replace('\\-', '-').replace('\\.', '.').replace('\\=', '=')
+        # Декодируем quoted-printable
         decoded = quopri.decodestring(text.encode('utf-8'))
+        # Пробуем разные кодировки
+        for encoding in ['utf-8', 'windows-1251', 'koi8-r']:
+            try:
+                result = decoded.decode(encoding, errors='ignore')
+                # Убираем оставшиеся '=' в конце строк (признак quoted-printable)
+                result = re.sub(r'=\s*\n', ' ', result)
+                result = re.sub(r'=\s*$', ' ', result)
+                return result
+            except:
+                continue
         return decoded.decode('utf-8', errors='ignore')
-    except:
+    except Exception as e:
+        logger.error(f"Decode error: {e}")
         return text
 
 def extract_links_from_html(html):
@@ -124,13 +139,36 @@ def extract_links_from_html(html):
     return clean
 
 def clean_text_from_email(html):
+    """Очищает HTML от CSS, стилей и quoted-printable мусора"""
     if not html:
         return ''
+    
+    # Декодируем quoted-printable
     html = decode_quoted_printable(html)
+    
+    # Убираем CSS блоки
     html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
+    
+    # Убираем все HTML теги
     html = re.sub(r'<[^>]+>', ' ', html)
+    
+    # Убираем CSS свойства
     html = re.sub(r'\{[^}]*\}', '', html)
+    
+    # Убираем множественные пробелы
     html = re.sub(r'\s+', ' ', html)
+    
+    # Убираем мусорные последовательности (quoted-printable остатки)
+    html = re.sub(r'=20', ' ', html)
+    html = re.sub(r'=3D', '=', html)
+    html = re.sub(r'=2E', '.', html)
+    html = re.sub(r'=2D', '-', html)
+    html = re.sub(r'=09', ' ', html)
+    
+    # Убираем Content-Type и другие заголовки
+    html = re.sub(r'Content-Type:[^\s]+', '', html, flags=re.IGNORECASE)
+    html = re.sub(r'Content-Transfer-Encoding:[^\s]+', '', html, flags=re.IGNORECASE)
+    
     return html.strip()
 
 def find_confirmation_link(links):
