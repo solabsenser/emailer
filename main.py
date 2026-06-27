@@ -10,11 +10,13 @@ from aiosmtpd.controller import Controller
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ===== КОНФИГ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -24,23 +26,24 @@ PORT = int(os.getenv("PORT", 10000))
 # ===== ХРАНИЛИЩЕ =====
 mailboxes = {}
 user_emails = defaultdict(list)
-user_last_message = {}
 
 def generate_email():
     alphabet = string.ascii_lowercase + string.digits
     local = ''.join(secrets.choice(alphabet) for _ in range(8))
     return f"{local}@{DOMAIN}"
 
-# ===== SMTP С ПОДДЕРЖКОЙ HTTP HEAD =====
+# ===== SMTP СЕРВЕР (НЕ ТРОГАЕТ RENDER) =====
 class MailHandler:
     async def handle_DATA(self, server, session, envelope):
         try:
+            if not envelope or not envelope.rcpt_tos:
+                return '500 Ignored'
+            
+            recipient = envelope.rcpt_tos[0]
+            if recipient not in mailboxes:
+                return f'550 Mailbox {recipient} not found'
+            
             msg = message_from_bytes(envelope.content, policy=default)
-            recipient = envelope.rcpt_tos[0] if envelope.rcpt_tos else None
-            
-            if not recipient or recipient not in mailboxes:
-                return '550 Mailbox not found'
-            
             subject = msg.get('Subject', '(no subject)')
             sender = msg.get('From', 'unknown')
             
@@ -62,26 +65,20 @@ class MailHandler:
                 'received_at': datetime.utcnow()
             })
             
+            logger.info(f"📩 Message for {recipient}")
             return '250 OK'
         except Exception as e:
-            logging.error(f"SMTP error: {e}")
+            logger.error(f"SMTP error: {e}")
             return '550 Error'
 
-class CustomMailHandler(MailHandler):
-    """Обработчик, игнорирующий HTTP-запросы"""
-    async def handle_DATA(self, server, session, envelope):
-        # Если это не SMTP-запрос
-        if not envelope or not envelope.rcpt_tos:
-            return '500 Ignored'
-        return await super().handle_DATA(server, session, envelope)
-
 def start_smtp():
-    handler = CustomMailHandler()
-    controller = Controller(handler, hostname='0.0.0.0', port=2525)
+    handler = MailHandler()
+    controller = Controller(handler, hostname='127.0.0.1', port=2525)
     controller.start()
+    logger.info("✅ SMTP server running on 127.0.0.1:2525")
     return controller
 
-# ===== WEB СЕРВЕР =====
+# ===== WEB СЕРВЕР ДЛЯ RENDER =====
 async def health_check(request):
     return web.Response(text="OK", status=200)
 
@@ -93,11 +90,49 @@ async def start_web():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logging.info(f"✅ Web server running on port {PORT}")
+    logger.info(f"✅ Web server running on port {PORT}")
 
 # ===== TELEGRAM БОТ =====
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
+
+# Храним ID последнего сообщения для каждого пользователя
+user_messages = {}
+
+async def safe_edit(user_id, text, reply_markup=None):
+    """Безопасное редактирование с отправкой нового сообщения при ошибке"""
+    msg_id = user_messages.get(user_id)
+    
+    # Если нет сохраненного сообщения - отправляем новое
+    if not msg_id:
+        try:
+            sent = await bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=reply_markup)
+            user_messages[user_id] = sent.message_id
+            return
+        except Exception as e:
+            logger.error(f"Send error: {e}")
+            return
+    
+    # Пытаемся отредактировать
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=user_id,
+            message_id=msg_id,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        # Если не получилось - отправляем новое
+        if "message can't be edited" in str(e).lower() or "message to edit not found" in str(e).lower():
+            try:
+                sent = await bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=reply_markup)
+                user_messages[user_id] = sent.message_id
+            except Exception as e2:
+                logger.error(f"Send error: {e2}")
+        else:
+            logger.error(f"Edit error: {e}")
 
 def get_main_menu():
     keyboard = InlineKeyboardMarkup(row_width=2)
@@ -109,75 +144,40 @@ def get_main_menu():
     )
     return keyboard
 
-async def update_message(user_id, text, reply_markup=None, parse_mode='Markdown'):
-    """Редактирует последнее сообщение пользователя"""
-    msg_id = user_last_message.get(user_id)
-    
-    try:
-        if msg_id:
-            await bot.edit_message_text(
-                text,
-                chat_id=user_id,
-                message_id=msg_id,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup
-            )
-        else:
-            sent = await bot.send_message(
-                user_id,
-                text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup
-            )
-            user_last_message[user_id] = sent.message_id
-    except Exception as e:
-        if "message to edit not found" in str(e):
-            sent = await bot.send_message(
-                user_id,
-                text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup
-            )
-            user_last_message[user_id] = sent.message_id
-        elif "message is not modified" in str(e):
-            pass
-        else:
-            logging.error(f"Update error: {e}")
-
 @dp.message_handler(commands=['start', 'menu'])
 async def start(message: types.Message):
     user_id = message.from_user.id
-    user_last_message[user_id] = message.message_id
+    user_messages[user_id] = message.message_id
     
-    await update_message(
+    await safe_edit(
         user_id,
         "📧 **Временная почта**\n\n"
         "Создавайте email и получайте письма в Telegram\n"
         f"🌐 Домен: `{DOMAIN}`",
-        reply_markup=get_main_menu()
+        get_main_menu()
     )
 
 @dp.message_handler()
 async def any_message(message: types.Message):
     user_id = message.from_user.id
-    user_last_message[user_id] = message.message_id
+    user_messages[user_id] = message.message_id
     
-    await update_message(
+    await safe_edit(
         user_id,
         "📧 Используйте кнопки ниже:",
-        reply_markup=get_main_menu()
+        get_main_menu()
     )
 
 @dp.callback_query_handler(lambda c: c.data == "create")
-async def create(callback: types.CallbackQuery):
+async def create_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
     
     if len(user_emails[str(user_id)]) >= 10:
-        await update_message(
+        await safe_edit(
             user_id,
             "❌ **Максимум 10 ящиков**",
-            reply_markup=get_main_menu()
+            get_main_menu()
         )
         return
     
@@ -187,32 +187,32 @@ async def create(callback: types.CallbackQuery):
             mailboxes[email] = {'user_id': str(user_id), 'messages': []}
             user_emails[str(user_id)].append(email)
             
-            await update_message(
+            await safe_edit(
                 user_id,
                 f"✅ **Создан email:**\n`{email}`\n\n"
                 f"📩 Отправляйте письма на этот адрес",
-                reply_markup=get_main_menu()
+                get_main_menu()
             )
             return
     
-    await update_message(
+    await safe_edit(
         user_id,
         "❌ **Ошибка создания**",
-        reply_markup=get_main_menu()
+        get_main_menu()
     )
 
 @dp.callback_query_handler(lambda c: c.data == "list")
-async def list_emails(callback: types.CallbackQuery):
+async def list_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
     
     emails = [e for e in user_emails.get(str(user_id), []) if e in mailboxes]
     
     if not emails:
-        await update_message(
+        await safe_edit(
             user_id,
             "📭 **У вас нет ящиков**",
-            reply_markup=get_main_menu()
+            get_main_menu()
         )
         return
     
@@ -221,20 +221,20 @@ async def list_emails(callback: types.CallbackQuery):
         msg_count = len(mailboxes[email].get('messages', []))
         text += f"• `{email}` — 📨 {msg_count} писем\n"
     
-    await update_message(user_id, text, reply_markup=get_main_menu())
+    await safe_edit(user_id, text, get_main_menu())
 
 @dp.callback_query_handler(lambda c: c.data == "check")
-async def check(callback: types.CallbackQuery):
+async def check_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
     
     emails = [e for e in user_emails.get(str(user_id), []) if e in mailboxes]
     
     if not emails:
-        await update_message(
+        await safe_edit(
             user_id,
             "📭 **Нет ящиков**",
-            reply_markup=get_main_menu()
+            get_main_menu()
         )
         return
     
@@ -247,33 +247,33 @@ async def check(callback: types.CallbackQuery):
         ))
     keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu"))
     
-    await update_message(
+    await safe_edit(
         user_id,
         "📨 **Выберите ящик:**",
-        reply_markup=keyboard
+        keyboard
     )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("view_"))
-async def view_mail(callback: types.CallbackQuery):
+async def view_callback(callback: types.CallbackQuery):
     email = callback.data.replace("view_", "")
     user_id = callback.from_user.id
     await callback.answer()
     
     if email not in mailboxes or mailboxes[email].get('user_id') != str(user_id):
-        await update_message(
+        await safe_edit(
             user_id,
             "❌ **Ящик не найден**",
-            reply_markup=get_main_menu()
+            get_main_menu()
         )
         return
     
     messages = mailboxes[email].get('messages', [])
     
     if not messages:
-        await update_message(
+        await safe_edit(
             user_id,
             f"📭 **Писем для `{email}` нет**",
-            reply_markup=get_main_menu()
+            get_main_menu()
         )
         return
     
@@ -298,20 +298,20 @@ async def view_mail(callback: types.CallbackQuery):
         InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu")
     )
     
-    await update_message(user_id, text, reply_markup=keyboard)
+    await safe_edit(user_id, text, keyboard)
 
 @dp.callback_query_handler(lambda c: c.data == "delete")
-async def delete_menu(callback: types.CallbackQuery):
+async def delete_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
     
     emails = [e for e in user_emails.get(str(user_id), []) if e in mailboxes]
     
     if not emails:
-        await update_message(
+        await safe_edit(
             user_id,
             "📭 **Нет ящиков**",
-            reply_markup=get_main_menu()
+            get_main_menu()
         )
         return
     
@@ -324,14 +324,14 @@ async def delete_menu(callback: types.CallbackQuery):
         ))
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="back_to_menu"))
     
-    await update_message(
+    await safe_edit(
         user_id,
         "⚠️ **Выберите ящик для удаления:**",
-        reply_markup=keyboard
+        keyboard
     )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("del_"))
-async def delete_confirm(callback: types.CallbackQuery):
+async def delete_confirm_callback(callback: types.CallbackQuery):
     email = callback.data.replace("del_", "")
     user_id = callback.from_user.id
     await callback.answer()
@@ -340,40 +340,42 @@ async def delete_confirm(callback: types.CallbackQuery):
         user_emails[str(user_id)].remove(email)
         del mailboxes[email]
         
-        await update_message(
+        await safe_edit(
             user_id,
             f"🗑 **Ящик удалён:**\n`{email}`",
-            reply_markup=get_main_menu()
+            get_main_menu()
         )
     else:
-        await update_message(
+        await safe_edit(
             user_id,
             "❌ **Ящик не найден**",
-            reply_markup=get_main_menu()
+            get_main_menu()
         )
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_menu")
-async def back_to_menu(callback: types.CallbackQuery):
+async def back_to_menu_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer()
     
-    await update_message(
+    await safe_edit(
         user_id,
         "📧 **Главное меню**",
-        reply_markup=get_main_menu()
+        get_main_menu()
     )
 
 # ===== ЗАПУСК =====
 async def main():
-    # Запускаем SMTP
+    # Запускаем SMTP на локалхосте (недоступен извне)
     smtp = start_smtp()
-    logging.info("✅ SMTP сервер запущен на порту 2525")
     
-    # Запускаем Web
+    # Запускаем Web для Render
     await start_web()
     
     # Запускаем бота
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
