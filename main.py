@@ -448,14 +448,23 @@ async def show_main_screen(user_id):
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     user_id = str(message.from_user.id)
+    
+    # Проверяем, есть ли ящик в БД
     account = user_accounts_cache.get(user_id) or await get_user(user_id)
-    await send_bot_message(
-        user_id,
-        "👋 **Добро пожаловать!**\n\n"
-        "📧 Временная почта\n"
-        "Создайте email для регистрации",
-        main_keyboard_with_account() if account else main_keyboard_no_account()
-    )
+    
+    if account:
+        # Если есть ящик — показываем главный экран
+        user_accounts_cache[user_id] = account
+        await show_main_screen(user_id)
+    else:
+        # Если нет — показываем приветствие
+        await send_bot_message(
+            user_id,
+            "👋 **Добро пожаловать!**\n\n"
+            "📧 Временная почта\n"
+            "Создайте email для регистрации",
+            main_keyboard_no_account()
+        )
 
 @dp.message_handler(lambda message: message.text == "📧 Создать почту")
 async def create_handler(message: types.Message):
