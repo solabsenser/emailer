@@ -10,6 +10,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.utils.executor import start_webhook
 from dotenv import load_dotenv
 import os
 
@@ -104,30 +105,12 @@ async def check_guerrilla_mail(account):
             
             return new_messages
 
-# ===== WEB СЕРВЕР =====
-async def webhook(request):
-    """Обработка webhook от Telegram"""
-    try:
-        if request.headers.get('content-type') == 'application/json':
-            data = await request.json()
-            
-            # Создаем объект Update из данных
-            update = types.Update(**data)
-            
-            # Обрабатываем через диспетчер
-            await dp.process_update(update)
-            return web.Response(text="OK", status=200)
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-    
-    return web.Response(text="Bad Request", status=400)
-
+# ===== WEB СЕРВЕР (для health check) =====
 async def health_check(request):
     return web.Response(text="OK", status=200)
 
 async def start_web():
     app = web.Application()
-    app.router.add_post(f'/{BOT_TOKEN}', webhook)
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
     
@@ -142,6 +125,9 @@ async def start_web():
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
+
+# Устанавливаем бота в контекст
+Bot.set_current(bot)
 
 def get_main_menu():
     keyboard = InlineKeyboardMarkup(row_width=2)
@@ -329,24 +315,34 @@ async def background_check():
             pass
         await asyncio.sleep(30)
 
-# ===== ЗАПУСК =====
-async def set_webhook():
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        await bot.set_webhook(webhook_url)
-        logger.info(f"✅ Webhook set to {webhook_url}")
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-
+# ===== ЗАПУСК (POLLING - БЕЗ WEBHOOK) =====
 async def main():
+    # Запускаем web сервер для health check
     await start_web()
-    await set_webhook()
+    
+    # Запускаем фоновую проверку
     asyncio.create_task(background_check())
     logger.info("🔄 Mail checker started")
     
-    while True:
-        await asyncio.sleep(3600)
+    # Запускаем бота в режиме polling (без webhook)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook deleted, using polling")
+        
+        # Запускаем polling с обработкой конфликтов
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break
+            except Exception as e:
+                if "Conflict" in str(e):
+                    logger.warning("⚠️ Conflict detected, waiting 5 seconds...")
+                    await asyncio.sleep(5)
+                else:
+                    logger.error(f"Polling error: {e}")
+                    await asyncio.sleep(5)
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
