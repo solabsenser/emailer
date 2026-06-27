@@ -143,7 +143,7 @@ def extract_links(text):
             clean_links.append(link)
     return clean_links
 
-# ===== БАЗА ДАННЫХ (ИСПРАВЛЕННАЯ) =====
+# ===== БАЗА ДАННЫХ =====
 def serialize_messages(messages):
     if not messages:
         return '[]'
@@ -182,13 +182,22 @@ async def get_user(user_id):
     rows = result.get('result', {}).get('rows', [])
     if rows:
         row = rows[0]
-        return {
-            'email': row[0],
-            'token': row[1],
-            'account_id': row[2],
-            'messages': deserialize_messages(row[3]),
-            'read_ids': json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
-        }
+        if isinstance(row, (list, tuple)):
+            return {
+                'email': str(row[0]) if row[0] else '',
+                'token': str(row[1]) if row[1] else '',
+                'account_id': str(row[2]) if row[2] else '',
+                'messages': deserialize_messages(row[3]),
+                'read_ids': json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
+            }
+        elif isinstance(row, dict):
+            return {
+                'email': str(row.get('email', '')),
+                'token': str(row.get('token', '')),
+                'account_id': str(row.get('account_id', '')),
+                'messages': deserialize_messages(row.get('messages', [])),
+                'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
+            }
     return None
 
 async def save_user(user_id, account):
@@ -213,7 +222,13 @@ async def get_all_users():
     sql = 'SELECT user_id FROM users'
     result = await turso.execute(sql)
     rows = result.get('result', {}).get('rows', [])
-    return [row[0] for row in rows]
+    user_ids = []
+    for row in rows:
+        if isinstance(row, (list, tuple)):
+            user_ids.append(str(row[0]))
+        elif isinstance(row, dict):
+            user_ids.append(str(row.get('user_id', '')))
+    return user_ids
 
 # ===== ХРАНИЛИЩЕ =====
 user_accounts_cache = {}
@@ -222,16 +237,33 @@ bot_messages = {}
 async def load_all_users_to_cache():
     sql = 'SELECT user_id, email, token, account_id, messages, read_ids FROM users'
     result = await turso.execute(sql)
+    
     rows = result.get('result', {}).get('rows', [])
+    
     for row in rows:
-        user_id = row[0]
-        user_accounts_cache[user_id] = {
-            'email': row[1],
-            'token': row[2],
-            'account_id': row[3],
-            'messages': deserialize_messages(row[4]),
-            'read_ids': json.loads(row[5]) if isinstance(row[5], str) else (row[5] or [])
-        }
+        if isinstance(row, (list, tuple)):
+            if len(row) >= 6:
+                user_id = str(row[0])
+                user_accounts_cache[user_id] = {
+                    'email': str(row[1]) if row[1] else '',
+                    'token': str(row[2]) if row[2] else '',
+                    'account_id': str(row[3]) if row[3] else '',
+                    'messages': deserialize_messages(row[4]),
+                    'read_ids': json.loads(row[5]) if isinstance(row[5], str) else (row[5] or [])
+                }
+        elif isinstance(row, dict):
+            user_id = str(row.get('user_id', ''))
+            user_accounts_cache[user_id] = {
+                'email': str(row.get('email', '')),
+                'token': str(row.get('token', '')),
+                'account_id': str(row.get('account_id', '')),
+                'messages': deserialize_messages(row.get('messages', [])),
+                'read_ids': json.loads(row.get('read_ids', '[]')) if isinstance(row.get('read_ids'), str) else (row.get('read_ids') or [])
+            }
+        else:
+            logger.warning(f"Unknown row format: {type(row)} - {row}")
+            continue
+    
     if rows:
         logger.info(f"✅ Loaded {len(rows)} users from Turso")
 
@@ -578,6 +610,8 @@ async def background_check():
         try:
             users = await get_all_users()
             for user_id in users:
+                if not user_id:
+                    continue
                 account = user_accounts_cache.get(user_id) or await get_user(user_id)
                 if account:
                     try:
@@ -594,10 +628,10 @@ async def background_check():
                             if msg.get('links'):
                                 text += f"🔗 {msg['links'][0][:60]}"
                             await bot.send_message(int(user_id), text, parse_mode='Markdown')
-                    except:
-                        pass
-        except:
-            pass
+                    except Exception as e:
+                        logger.error(f"Background check error for {user_id}: {e}")
+        except Exception as e:
+            logger.error(f"Background check error: {e}")
         await asyncio.sleep(30)
 
 async def main():
