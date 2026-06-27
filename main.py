@@ -177,6 +177,7 @@ async def init_db():
     logger.info("✅ Database initialized")
 
 async def get_user(user_id):
+    user_id = str(user_id)
     sql = 'SELECT email, token, account_id, messages, read_ids FROM users WHERE user_id = ?'
     result = await turso.execute(sql, [user_id])
     rows = result.get('result', {}).get('rows', [])
@@ -201,6 +202,7 @@ async def get_user(user_id):
     return None
 
 async def save_user(user_id, account):
+    user_id = str(user_id)
     sql = '''
         INSERT OR REPLACE INTO users (user_id, email, token, account_id, messages, read_ids)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -215,6 +217,7 @@ async def save_user(user_id, account):
     ])
 
 async def delete_user(user_id):
+    user_id = str(user_id)
     sql = 'DELETE FROM users WHERE user_id = ?'
     await turso.execute(sql, [user_id])
 
@@ -377,6 +380,7 @@ def confirm_delete_keyboard():
     return keyboard
 
 async def send_bot_message(user_id, text, reply_markup=None):
+    user_id = str(user_id)
     old_msg_id = bot_messages.get(user_id)
     if old_msg_id:
         try:
@@ -399,11 +403,12 @@ async def send_bot_message(user_id, text, reply_markup=None):
         return None
 
 async def show_main_screen(user_id):
-    account = user_accounts_cache.get(str(user_id))
+    user_id = str(user_id)
+    account = user_accounts_cache.get(user_id)
     if not account:
-        account = await get_user(str(user_id))
+        account = await get_user(user_id)
         if account:
-            user_accounts_cache[str(user_id)] = account
+            user_accounts_cache[user_id] = account
     
     if not account:
         await send_bot_message(
@@ -507,8 +512,12 @@ async def check_handler(message: types.Message):
             if msg.get('code'):
                 text += f"   🔑 Код: `{msg['code']}`\n"
             if msg.get('links'):
-                for link in msg['links'][:1]:
-                    text += f"   🔗 {link[:80]}...\n"
+                link = msg['links'][0]
+                if isinstance(link, str):
+                    link_preview = link[:80] + "..." if len(link) > 80 else link
+                else:
+                    link_preview = str(link)[:80] + "..."
+                text += f"   🔗 {link_preview}\n"
             text += "\n"
         
         if len(messages) > 10:
@@ -612,9 +621,9 @@ async def background_check():
             for user_id in users:
                 if not user_id:
                     continue
-                account = user_accounts_cache.get(user_id) or await get_user(user_id)
-                if account:
-                    try:
+                try:
+                    account = user_accounts_cache.get(user_id) or await get_user(user_id)
+                    if account:
                         new = await check_mailcat(account)
                         if new:
                             account.setdefault('messages', []).extend(new)
@@ -626,10 +635,15 @@ async def background_check():
                             if msg.get('code'):
                                 text += f"🔑 Код: `{msg['code']}`\n"
                             if msg.get('links'):
-                                text += f"🔗 {msg['links'][0][:60]}"
+                                link = msg['links'][0]
+                                if isinstance(link, str):
+                                    link_preview = link[:60] + "..." if len(link) > 60 else link
+                                else:
+                                    link_preview = str(link)[:60] + "..."
+                                text += f"🔗 {link_preview}\n"
                             await bot.send_message(int(user_id), text, parse_mode='Markdown')
-                    except Exception as e:
-                        logger.error(f"Background check error for {user_id}: {e}")
+                except Exception as e:
+                    logger.error(f"Background check error for {user_id}: {e}")
         except Exception as e:
             logger.error(f"Background check error: {e}")
         await asyncio.sleep(30)
