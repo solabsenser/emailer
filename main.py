@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 # ===== ХРАНИЛИЩЕ =====
 user_accounts = {}
-user_messages = {}
+user_messages = {}  # {user_id: message_id}
 
 def decode_header_value(value):
     if not value:
@@ -170,7 +170,6 @@ def back_keyboard():
     return keyboard
 
 def confirm_delete_keyboard():
-    """Клавиатура подтверждения удаления"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     keyboard.add(
         KeyboardButton("✅ Да, удалить"),
@@ -178,7 +177,18 @@ def confirm_delete_keyboard():
     )
     return keyboard
 
-async def send_message(user_id, text, reply_markup=None):
+async def send_new_message(user_id, text, reply_markup=None):
+    """Отправляет новое сообщение, удаляя старое"""
+    # Удаляем старое сообщение
+    old_msg_id = user_messages.get(user_id)
+    if old_msg_id:
+        try:
+            await bot.delete_message(user_id, old_msg_id)
+        except:
+            pass
+        user_messages.pop(user_id, None)
+    
+    # Отправляем новое
     try:
         sent = await bot.send_message(
             user_id,
@@ -192,35 +202,11 @@ async def send_message(user_id, text, reply_markup=None):
         logger.error(f"Send error: {e}")
         return None
 
-async def edit_or_send(user_id, text, reply_markup=None):
-    msg_id = user_messages.get(user_id)
-    
-    if msg_id:
-        try:
-            await bot.edit_message_text(
-                text,
-                chat_id=user_id,
-                message_id=msg_id,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-            return
-        except Exception as e:
-            if "message is not modified" in str(e).lower():
-                return
-            if "message to edit not found" in str(e).lower():
-                user_messages.pop(user_id, None)
-            else:
-                logger.error(f"Edit error: {e}")
-                user_messages.pop(user_id, None)
-    
-    await send_message(user_id, text, reply_markup)
-
 async def show_main_screen(user_id):
     account = user_accounts.get(str(user_id))
     
     if not account:
-        await edit_or_send(
+        await send_new_message(
             user_id,
             "📧 **Временная почта**\n\n"
             "Создайте временный email для регистрации\n"
@@ -238,7 +224,7 @@ async def show_main_screen(user_id):
     if code_count:
         text += f"🔑 Кодов: **{code_count}**"
     
-    await edit_or_send(
+    await send_new_message(
         user_id,
         text,
         main_keyboard_with_account()
@@ -265,7 +251,7 @@ async def create_handler(message: types.Message):
         await show_main_screen(user_id)
     except Exception as e:
         logger.error(f"Create error: {e}")
-        await edit_or_send(
+        await send_new_message(
             user_id,
             f"❌ **Ошибка создания**\n\n{str(e)[:200]}",
             main_keyboard_no_account()
@@ -281,7 +267,7 @@ async def check_handler(message: types.Message):
         await show_main_screen(user_id)
         return
     
-    await edit_or_send(user_id, "🔄 **Проверяю почту...**", None)
+    await send_new_message(user_id, "🔄 **Проверяю почту...**", None)
     
     try:
         new = await check_mailcat(account)
@@ -290,7 +276,7 @@ async def check_handler(message: types.Message):
         
         messages = account.get('messages', [])
         if not messages:
-            await edit_or_send(
+            await send_new_message(
                 user_id,
                 "📭 **Писем нет**\n\nНажмите «Назад» для возврата",
                 back_keyboard()
@@ -314,11 +300,11 @@ async def check_handler(message: types.Message):
         
         text += f"\n📌 **Всего:** {len(messages)}"
         
-        await edit_or_send(user_id, text, back_keyboard())
+        await send_new_message(user_id, text, back_keyboard())
         
     except Exception as e:
         logger.error(f"Check error: {e}")
-        await edit_or_send(
+        await send_new_message(
             user_id,
             f"❌ **Ошибка проверки**\n\n{str(e)[:200]}",
             back_keyboard()
@@ -334,7 +320,7 @@ async def delete_handler(message: types.Message):
         await show_main_screen(user_id)
         return
     
-    await edit_or_send(
+    await send_new_message(
         user_id,
         f"⚠️ **Вы уверены, что хотите удалить ящик?**\n\n"
         f"📧 `{account['email']}`\n\n"
@@ -361,7 +347,7 @@ async def confirm_delete_handler(message: types.Message):
     
     del user_accounts[str(user_id)]
     
-    await edit_or_send(
+    await send_new_message(
         user_id,
         "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости",
         main_keyboard_no_account()
