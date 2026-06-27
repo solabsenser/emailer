@@ -143,10 +143,8 @@ def extract_links(text):
     return clean_links
 
 def escape_markdown(text):
-    """Экранирует специальные символы Markdown"""
     if not text:
         return ''
-    # Экранируем только опасные символы
     chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     for char in chars:
         text = text.replace(char, f'\\{char}')
@@ -540,11 +538,9 @@ async def show_body_callback(callback: types.CallbackQuery):
     
     msg = valid_messages[-idx]
     
-    # Экранируем тело письма для Markdown
     body = msg.get('body', 'Нет текста')
-    # Убираем лишние переносы и экранируем
-    body = body.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]')
-    body = body.replace('`', '\\`').replace('|', '\\|')
+    # Экранируем для Markdown
+    body = escape_markdown(body)
     
     text = f"📄 **Полный текст письма**\n\n"
     text += f"📌 **От:** {msg.get('sender', 'unknown')}\n"
@@ -561,11 +557,11 @@ async def show_body_callback(callback: types.CallbackQuery):
     try:
         await callback.message.edit_text(text, parse_mode='Markdown', reply_markup=keyboard)
     except Exception as e:
-        # Если ошибка с Markdown - отправляем без форматирования
         if "Can't parse entities" in str(e):
-            await callback.message.edit_text(text.replace('_', '').replace('*', ''), reply_markup=keyboard)
+            await callback.message.edit_text(text, reply_markup=keyboard)
         else:
-            await callback.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
+            logger.error(f"Show body error: {e}")
+            await callback.answer("❌ Ошибка отображения", show_alert=True)
     
     await callback.answer()
 
@@ -573,6 +569,7 @@ async def show_body_callback(callback: types.CallbackQuery):
 async def back_to_messages_callback(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
     await callback.answer()
+    # Имитируем вызов check_handler
     await check_handler(callback.message)
 
 @dp.message_handler(lambda message: message.text == "📨 Проверить почту")
@@ -721,11 +718,15 @@ async def background_check():
                 try:
                     account = user_accounts_cache.get(user_id) or await get_user(user_id)
                     if account:
+                        # ПРОВЕРЯЕМ ТИП — если не список, пересоздаём
                         if not isinstance(account.get('messages'), list):
+                            logger.warning(f"⚠️ messages is {type(account.get('messages'))}, fixing for user {user_id}")
                             account['messages'] = []
+                            # Сразу сохраняем в БД
                             await save_user(user_id, account)
-                            logger.info(f"🔧 Fixed messages for user {user_id}")
+                            logger.info(f"✅ Fixed messages for user {user_id}")
                         
+                        # Теперь точно работаем со списком
                         new = await check_mailcat(account)
                         if new:
                             account['messages'].extend(new)
