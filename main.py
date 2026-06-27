@@ -142,6 +142,16 @@ def extract_links(text):
             clean_links.append(link)
     return clean_links
 
+def escape_markdown(text):
+    """Экранирует специальные символы Markdown"""
+    if not text:
+        return ''
+    # Экранируем только опасные символы
+    chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in chars:
+        text = text.replace(char, f'\\{char}')
+    return text
+
 # ===== БАЗА ДАННЫХ =====
 def extract_value(data):
     if isinstance(data, dict) and 'value' in data:
@@ -503,11 +513,10 @@ async def create_handler(message: types.Message):
             main_keyboard_no_account()
         )
 
-# ===== НОВЫЙ ОБРАБОТЧИК ДЛЯ ПРОСМОТРА ТЕКСТА ПИСЬМА =====
+# ===== ОБРАБОТЧИК ДЛЯ ПРОСМОТРА ТЕКСТА ПИСЬМА =====
 @dp.callback_query_handler(lambda c: c.data.startswith("show_body_"))
 async def show_body_callback(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
-    # Извлекаем номер письма из callback_data
     parts = callback.data.split('_')
     if len(parts) < 3:
         await callback.answer("❌ Ошибка", show_alert=True)
@@ -529,29 +538,41 @@ async def show_body_callback(callback: types.CallbackQuery):
         await callback.answer("❌ Письмо не найдено", show_alert=True)
         return
     
-    msg = valid_messages[-idx]  # Так как в списке они в обратном порядке
+    msg = valid_messages[-idx]
     
-    # Формируем текст письма
+    # Экранируем тело письма для Markdown
+    body = msg.get('body', 'Нет текста')
+    # Убираем лишние переносы и экранируем
+    body = body.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]')
+    body = body.replace('`', '\\`').replace('|', '\\|')
+    
     text = f"📄 **Полный текст письма**\n\n"
     text += f"📌 **От:** {msg.get('sender', 'unknown')}\n"
     text += f"📌 **Тема:** {msg.get('subject', '(no subject)')}\n"
     text += f"📌 **Время:** {datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M %d.%m.%Y')}\n\n"
-    text += f"📝 **Текст:**\n{msg.get('body', 'Нет текста')[:1000]}"
+    text += f"📝 **Текст:**\n{body[:1000]}"
     
-    if len(msg.get('body', '')) > 1000:
-        text += "\n\n... (текст обрезан, всего символов: {})".format(len(msg.get('body', '')))
+    if len(body) > 1000:
+        text += f"\n\n... (текст обрезан, всего символов: {len(body)})"
     
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(InlineKeyboardButton("🔙 Назад к письмам", callback_data="back_to_messages"))
     
-    await callback.message.edit_text(text, parse_mode='Markdown', reply_markup=keyboard)
+    try:
+        await callback.message.edit_text(text, parse_mode='Markdown', reply_markup=keyboard)
+    except Exception as e:
+        # Если ошибка с Markdown - отправляем без форматирования
+        if "Can't parse entities" in str(e):
+            await callback.message.edit_text(text.replace('_', '').replace('*', ''), reply_markup=keyboard)
+        else:
+            await callback.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
+    
     await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_messages")
 async def back_to_messages_callback(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
     await callback.answer()
-    # Возвращаемся к списку писем
     await check_handler(callback.message)
 
 @dp.message_handler(lambda message: message.text == "📨 Проверить почту")
@@ -601,14 +622,11 @@ async def check_handler(message: types.Message):
             text += f"... и еще {len(valid_messages)-10} писем\n"
         text += f"\n📌 **Всего:** {len(valid_messages)}"
         
-        # Создаём клавиатуру с кнопками для просмотра текста
         keyboard = InlineKeyboardMarkup(row_width=2)
-        for idx, msg in enumerate(valid_messages[-10:][::-1], 1):
-            # Используем callback с номером письма
-            callback_data = f"show_body_{idx}"
+        for idx in range(1, min(len(valid_messages), 10) + 1):
             keyboard.insert(InlineKeyboardButton(
                 f"📄 Письмо {idx}",
-                callback_data=callback_data
+                callback_data=f"show_body_{idx}"
             ))
         keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_main"))
         
