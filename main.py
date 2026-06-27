@@ -35,14 +35,13 @@ if TURSO_URL.startswith("libsql://"):
 # Убираем порт если есть
 TURSO_URL = TURSO_URL.replace(":443", "").rstrip("/")
 
-# ===== TURSO HTTP API (правильный формат с типами) =====
+# ===== TURSO HTTP API =====
 class TursoClient:
     def __init__(self, url, token):
         self.url = url
         self.token = token
     
     def _format_params(self, params):
-        """Форматирует параметры для Turso"""
         if not params:
             return []
         formatted = []
@@ -60,20 +59,13 @@ class TursoClient:
         return formatted
     
     async def execute(self, sql, params=None):
-        """Выполняет SQL через HTTP API"""
         async with aiohttp.ClientSession() as session:
             headers = {
                 "Authorization": f"Bearer {self.token}",
                 "Content-Type": "application/json"
             }
             
-            # Формируем правильный payload
-            payload = {
-                "stmt": {
-                    "sql": sql
-                }
-            }
-            
+            payload = {"stmt": {"sql": sql}}
             if params:
                 payload["stmt"]["args"] = self._format_params(params)
             
@@ -85,18 +77,79 @@ class TursoClient:
                         error = await resp.text()
                         raise Exception(f"Turso error {resp.status}: {error}")
                     data = await resp.json()
-                    
                     if data.get("error"):
                         raise Exception(f"Turso error: {data['error']}")
-                    
                     return data
             except aiohttp.ClientError as e:
                 raise Exception(f"Connection error: {e}")
 
 turso = TursoClient(TURSO_URL, TURSO_TOKEN)
 
+# ===== ФУНКЦИИ ПАРСИНГА =====
+def decode_header_value(value):
+    if not value:
+        return ''
+    try:
+        decoded_parts = []
+        for part, encoding in email.header.decode_header(value):
+            if isinstance(part, bytes):
+                try:
+                    if encoding:
+                        part = part.decode(encoding, errors='ignore')
+                    else:
+                        part = part.decode('utf-8', errors='ignore')
+                except:
+                    part = part.decode('utf-8', errors='ignore')
+            decoded_parts.append(str(part))
+        return ' '.join(decoded_parts)
+    except:
+        return value
+
+def clean_body(body):
+    """Очищает тело письма от мусора"""
+    if not body:
+        return ''
+    # Убираем HTML теги
+    body = re.sub(r'<[^>]+>', ' ', body)
+    # Убираем множественные пробелы и переносы
+    body = re.sub(r'\s+', ' ', body)
+    # Убираем base64 и прочий мусор
+    body = re.sub(r'[A-Za-z0-9+/=]{50,}', '', body)
+    return body[:500].strip()
+
+def extract_code(text):
+    """Находит код подтверждения"""
+    if not text:
+        return None
+    patterns = [
+        r'\b(\d{4,8})\b',
+        r'код[:\s]*([A-Z0-9]{4,8})',
+        r'code[:\s]*([A-Z0-9]{4,8})',
+        r'verification code[:\s]*([A-Z0-9]{4,8})',
+        r'подтверждения[:\s]*([A-Z0-9]{4,8})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            code = match.group(1) if match.groups() else match.group(0)
+            if len(code) >= 4:
+                return code
+    return None
+
+def extract_links(text):
+    if not text:
+        return []
+    url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+    links = re.findall(url_pattern, text)
+    clean_links = []
+    for link in links:
+        link = link.strip('.,;:!?()[]{}"\'')
+        if link.startswith('http') or link.startswith('www'):
+            clean_links.append(link)
+    return clean_links
+
+# ===== БАЗА ДАННЫХ =====
 async def init_db():
-    """Инициализация базы данных"""
     sql = '''
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
@@ -114,7 +167,6 @@ async def init_db():
 async def get_user(user_id):
     sql = 'SELECT email, token, account_id, messages, read_ids FROM users WHERE user_id = ?'
     result = await turso.execute(sql, [user_id])
-    
     rows = result.get('result', {}).get('rows', [])
     if rows:
         row = rows[0]
@@ -151,7 +203,7 @@ async def get_all_users():
     rows = result.get('result', {}).get('rows', [])
     return [row[0] for row in rows]
 
-# ===== ХРАНИЛИЩЕ (кэш в памяти) =====
+# ===== ХРАНИЛИЩЕ =====
 user_accounts_cache = {}
 bot_messages = {}
 
@@ -159,7 +211,6 @@ async def load_all_users_to_cache():
     sql = 'SELECT user_id, email, token, account_id, messages, read_ids FROM users'
     result = await turso.execute(sql)
     rows = result.get('result', {}).get('rows', [])
-    
     for row in rows:
         user_id = row[0]
         user_accounts_cache[user_id] = {
@@ -169,7 +220,6 @@ async def load_all_users_to_cache():
             'messages': json.loads(row[4]) if row[4] else [],
             'read_ids': json.loads(row[5]) if row[5] else []
         }
-    
     if rows:
         logger.info(f"✅ Loaded {len(rows)} users from Turso")
 
@@ -204,6 +254,7 @@ async def check_mailcat(account):
                 return []
             data = await resp.json()
             messages = data.get('data', [])
+        
         new_messages = []
         for msg in messages:
             msg_id = msg.get('id')
@@ -213,74 +264,29 @@ async def check_mailcat(account):
                     if resp2.status in [200, 201]:
                         full = await resp2.json()
                         email_data = full.get('data', {})
+                        
                         raw_subject = email_data.get('email', {}).get('subject', '(no subject)')
                         subject = decode_header_value(raw_subject)
                         raw_from = email_data.get('email', {}).get('from', 'unknown')
                         sender = decode_header_value(raw_from)
+                        
                         body = email_data.get('email', {}).get('text', '')
                         if not body:
                             body = email_data.get('email', {}).get('html', '')
-                            body = re.sub(r'<[^>]+>', '', body)
-                        code = extract_code(body) or email_data.get('code', '')
-                        links = extract_links(body)
+                        
+                        clean_text = clean_body(body)
+                        code = extract_code(clean_text)
+                        links = extract_links(clean_text)
+                        
                         new_messages.append({
                             'sender': sender,
                             'subject': subject,
-                            'body': body[:5000],
+                            'body': clean_text[:500],
                             'code': code,
-                            'links': links[:5],
+                            'links': links[:3],
                             'received_at': datetime.now().isoformat()
                         })
         return new_messages
-
-def decode_header_value(value):
-    if not value:
-        return ''
-    try:
-        decoded_parts = []
-        for part, encoding in email.header.decode_header(value):
-            if isinstance(part, bytes):
-                try:
-                    if encoding:
-                        part = part.decode(encoding, errors='ignore')
-                    else:
-                        part = part.decode('utf-8', errors='ignore')
-                except:
-                    part = part.decode('utf-8', errors='ignore')
-            decoded_parts.append(str(part))
-        return ' '.join(decoded_parts)
-    except:
-        return value
-
-def extract_links(text):
-    if not text:
-        return []
-    url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
-    links = re.findall(url_pattern, text)
-    clean_links = []
-    for link in links:
-        link = link.strip('.,;:!?()[]{}"\'' )
-        if link.startswith('http') or link.startswith('www'):
-            clean_links.append(link)
-    return clean_links
-
-def extract_code(text):
-    if not text:
-        return None
-    patterns = [
-        r'\b\d{4,8}\b',
-        r'\b[A-Z0-9]{4,8}\b',
-        r'код[:\s]*([A-Z0-9]{4,8})',
-        r'verification code[:\s]*([A-Z0-9]{4,8})',
-        r'код подтверждения[:\s]*([A-Z0-9]{4,8})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            code = match.group(1) if match.groups() else match.group(0)
-            if len(code) >= 4:
-                return code
-    return None
 
 # ===== WEB СЕРВЕР =====
 async def health_check(request):
@@ -300,7 +306,6 @@ async def start_web():
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# ===== КЛАВИАТУРЫ =====
 def main_keyboard_no_account():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
     keyboard.add(KeyboardButton("📧 Создать почту"))
@@ -459,7 +464,7 @@ async def check_handler(message: types.Message):
                 text += f"   🔑 Код: `{msg['code']}`\n"
             if msg.get('links'):
                 for link in msg['links'][:1]:
-                    text += f"   🔗 {link[:40]}...\n"
+                    text += f"   🔗 {link[:80]}...\n"
             text += "\n"
         
         if len(messages) > 10:
@@ -585,17 +590,14 @@ async def background_check():
 
 async def main():
     try:
-        # Инициализация БД
         await init_db()
         logger.info("✅ Database initialized")
         
-        # Загружаем всех пользователей в кэш
         await load_all_users_to_cache()
         
         await start_web()
         asyncio.create_task(background_check())
         
-        # Удаляем webhook
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("✅ Webhook deleted")
