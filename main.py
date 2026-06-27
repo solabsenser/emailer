@@ -212,6 +212,11 @@ async def save_user(user_id, account):
     token = extract_value(account.get('token', ''))
     account_id = extract_value(account.get('account_id', ''))
     
+    # Гарантируем, что messages — это список
+    messages = account.get('messages', [])
+    if not isinstance(messages, list):
+        messages = []
+    
     sql = '''
         INSERT OR REPLACE INTO users (user_id, email, token, account_id, messages, read_ids)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -221,7 +226,7 @@ async def save_user(user_id, account):
         str(email),
         str(token),
         str(account_id),
-        serialize_messages(account.get('messages', [])),
+        serialize_messages(messages),
         json.dumps(account.get('read_ids', []))
     ])
 
@@ -275,6 +280,11 @@ async def load_all_users_to_cache():
             logger.warning(f"Unknown row format: {type(row)} - {row}")
             continue
     
+    # Принудительная нормализация для всех пользователей
+    for user_id in user_accounts_cache:
+        if not isinstance(user_accounts_cache[user_id].get('messages'), list):
+            user_accounts_cache[user_id]['messages'] = []
+    
     if rows:
         logger.info(f"✅ Loaded {len(rows)} users from Turso")
 
@@ -302,8 +312,10 @@ async def create_mailcat_mailbox():
             }
 
 async def check_mailcat(account):
-    # Убеждаемся, что messages — это список
-    if 'messages' not in account or not isinstance(account['messages'], list):
+    # ПРИНУДИТЕЛЬНО превращаем messages в список
+    if 'messages' not in account:
+        account['messages'] = []
+    elif not isinstance(account['messages'], list):
         account['messages'] = []
     
     async with aiohttp.ClientSession() as session:
@@ -655,12 +667,12 @@ async def background_check():
                 try:
                     account = user_accounts_cache.get(user_id) or await get_user(user_id)
                     if account:
-                        # Нормализуем messages в список
+                        # ПРИНУДИТЕЛЬНО превращаем messages в список
                         if 'messages' not in account or not isinstance(account['messages'], list):
                             account['messages'] = []
                         
                         new = await check_mailcat(account)
-                        if new:
+                        if new and isinstance(account['messages'], list):
                             account['messages'].extend(new)
                             await save_user(user_id, account)
                             
