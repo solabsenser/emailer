@@ -23,21 +23,21 @@ PORT = int(os.getenv("PORT", 10000))
 TURSO_URL = os.getenv("TURSO_URL")
 TURSO_TOKEN = os.getenv("TURSO_TOKEN")
 
+if not TURSO_URL or not TURSO_TOKEN:
+    logger.error("❌ TURSO_URL or TURSO_TOKEN not set in .env")
+    exit(1)
+
 # ===== TURSO БАЗА ДАННЫХ =====
 try:
-    from libsql_client import create_client_sync
-    client = create_client_sync(TURSO_URL, auth_token=TURSO_TOKEN)
+    from libsql_experimental import sqlite3 as libsql_conn
+    client = libsql_conn.connect(TURSO_URL)
+    client.execute("PRAGMA journal_mode=WAL")
     logger.info("✅ Connected to Turso")
 except Exception as e:
     logger.error(f"❌ Turso connection failed: {e}")
-    # Для локального теста без Turso
-    client = None
+    exit(1)
 
 def init_db():
-    if not client:
-        logger.warning("⚠️ Turso not available, using fallback SQLite")
-        return
-    
     client.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
@@ -49,17 +49,15 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    client.commit()
     logger.info("✅ Database initialized")
 
 def get_user(user_id):
-    if not client:
-        return None
-    
-    result = client.execute(
+    cursor = client.execute(
         'SELECT email, token, account_id, messages, read_ids FROM users WHERE user_id = ?',
         (user_id,)
     )
-    row = result.fetchone()
+    row = cursor.fetchone()
     
     if row:
         return {
@@ -72,9 +70,6 @@ def get_user(user_id):
     return None
 
 def save_user(user_id, account):
-    if not client:
-        return
-    
     client.execute('''
         INSERT OR REPLACE INTO users (user_id, email, token, account_id, messages, read_ids)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -86,30 +81,23 @@ def save_user(user_id, account):
         json.dumps(account.get('messages', [])),
         json.dumps(account.get('read_ids', []))
     ))
+    client.commit()
 
 def delete_user(user_id):
-    if not client:
-        return
-    
     client.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+    client.commit()
 
 def get_all_users():
-    if not client:
-        return []
-    
-    result = client.execute('SELECT user_id FROM users')
-    return [row[0] for row in result.fetchall()]
+    cursor = client.execute('SELECT user_id FROM users')
+    return [row[0] for row in cursor.fetchall()]
 
 # ===== ХРАНИЛИЩЕ (кэш в памяти) =====
 user_accounts_cache = {}
 bot_messages = {}
 
 def load_all_users_to_cache():
-    if not client:
-        return
-    
-    result = client.execute('SELECT user_id, email, token, account_id, messages, read_ids FROM users')
-    rows = result.fetchall()
+    cursor = client.execute('SELECT user_id, email, token, account_id, messages, read_ids FROM users')
+    rows = cursor.fetchall()
     
     for row in rows:
         user_id = row[0]
@@ -534,19 +522,33 @@ async def background_check():
         await asyncio.sleep(30)
 
 async def main():
+    # Инициализация БД
     init_db()
+    
+    # Загружаем всех пользователей в кэш
     load_all_users_to_cache()
     
     await start_web()
     asyncio.create_task(background_check())
-    await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Удаляем webhook
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook deleted")
+    except:
+        pass
     
     while True:
         try:
             await dp.start_polling(bot)
             break
-        except:
-            await asyncio.sleep(5)
+        except Exception as e:
+            if "ConflictError" in str(e) or "TerminatedByOtherGetUpdates" in str(e):
+                logger.warning("⚠️ Conflict detected, waiting 5 seconds...")
+                await asyncio.sleep(5)
+            else:
+                logger.error(f"Polling error: {e}")
+                await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
