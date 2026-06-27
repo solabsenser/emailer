@@ -5,7 +5,6 @@ import string
 import aiohttp
 import base64
 from datetime import datetime
-from collections import defaultdict
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -20,11 +19,10 @@ logger = logging.getLogger(__name__)
 # ===== КОНФИГ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
-DOMAIN = "guerrillamail.com"
 
 # ===== ХРАНИЛИЩЕ =====
-user_accounts = {}  # {user_id: {email, sid, messages: [], ids: []}}
-user_messages = {}  # {user_id: message_id}
+user_accounts = {}
+user_messages = {}
 
 # ===== GUERRILLA MAIL API =====
 GM_API = "https://api.guerrillamail.com/ajax.php"
@@ -104,7 +102,7 @@ async def check_guerrilla_mail(account):
             
             return new_messages
 
-# ===== WEB СЕРВЕР =====
+# ===== WEB СЕРВЕР (только для health check) =====
 async def health_check(request):
     return web.Response(text="OK", status=200)
 
@@ -135,11 +133,10 @@ def get_main_menu():
     )
     return keyboard
 
-async def safe_edit(user_id, text, reply_markup=None):
-    """Редактирует одно сообщение, никогда не дублирует"""
+async def update_or_send(user_id, text, reply_markup=None):
+    """Единый метод для обновления сообщения - без дублей"""
     msg_id = user_messages.get(user_id)
     
-    # Пробуем отредактировать существующее сообщение
     if msg_id:
         try:
             await bot.edit_message_text(
@@ -151,33 +148,26 @@ async def safe_edit(user_id, text, reply_markup=None):
             )
             return
         except Exception as e:
-            # Если сообщение не найдено или не может быть отредактировано
-            if "message to edit not found" in str(e).lower() or "message can't be edited" in str(e).lower():
-                # Удаляем старый ID, отправим новое
+            if "message is not modified" in str(e).lower():
+                return
+            if "message to edit not found" in str(e).lower():
                 user_messages.pop(user_id, None)
-            else:
-                # Другие ошибки логируем, но не останавливаемся
-                logger.error(f"Edit error: {e}")
     
-    # Если нет сообщения или не удалось отредактировать - отправляем новое
-    try:
-        sent = await bot.send_message(
-            user_id,
-            text,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-        user_messages[user_id] = sent.message_id
-    except Exception as e:
-        logger.error(f"Send error: {e}")
+    # Отправляем новое
+    sent = await bot.send_message(
+        user_id,
+        text,
+        parse_mode='Markdown',
+        reply_markup=reply_markup
+    )
+    user_messages[user_id] = sent.message_id
 
 @dp.message_handler(commands=['start', 'menu'])
 async def start(message: types.Message):
     user_id = message.from_user.id
-    # Сохраняем ID первого сообщения
     user_messages[user_id] = message.message_id
     
-    await safe_edit(
+    await update_or_send(
         user_id,
         "📧 **Временная почта**\n\n"
         "Создавайте email и получайте письма\n"
@@ -190,7 +180,7 @@ async def start(message: types.Message):
 async def any_message(message: types.Message):
     user_id = message.from_user.id
     user_messages[user_id] = message.message_id
-    await safe_edit(user_id, "📧 Используйте кнопки:", get_main_menu())
+    await update_or_send(user_id, "📧 Используйте кнопки:", get_main_menu())
 
 @dp.callback_query_handler(lambda c: True)
 async def handle_callbacks(callback: types.CallbackQuery):
@@ -201,32 +191,31 @@ async def handle_callbacks(callback: types.CallbackQuery):
     
     if data == "create":
         if str(user_id) in user_accounts:
-            await safe_edit(user_id, "❌ **У вас уже есть ящик**\n\nУдалите старый", get_main_menu())
+            await update_or_send(user_id, "❌ **У вас уже есть ящик**", get_main_menu())
             return
         
         try:
             account = await create_guerrilla_email()
             user_accounts[str(user_id)] = account
             
-            await safe_edit(
+            await update_or_send(
                 user_id,
                 f"✅ **Создан email:**\n`{account['email']}`\n\n"
-                f"📩 Используйте этот адрес для регистрации\n"
-                f"🔄 Нажмите «Проверить почту»",
+                f"📩 Используйте этот адрес для регистрации",
                 get_main_menu()
             )
         except Exception as e:
             logger.error(f"Create error: {e}")
-            await safe_edit(user_id, "❌ **Ошибка создания**\nПопробуйте через минуту", get_main_menu())
+            await update_or_send(user_id, "❌ **Ошибка создания**", get_main_menu())
     
     elif data == "list":
         account = user_accounts.get(str(user_id))
         if not account:
-            await safe_edit(user_id, "📭 **Нет ящика**", get_main_menu())
+            await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
             return
         
         msg_count = len(account.get('messages', []))
-        await safe_edit(
+        await update_or_send(
             user_id,
             f"📬 **Ваш ящик:**\n`{account['email']}`\n\n📨 Писем: {msg_count}",
             get_main_menu()
@@ -235,40 +224,40 @@ async def handle_callbacks(callback: types.CallbackQuery):
     elif data == "check":
         account = user_accounts.get(str(user_id))
         if not account:
-            await safe_edit(user_id, "📭 **Нет ящика**", get_main_menu())
+            await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
             return
         
-        await safe_edit(user_id, "🔄 **Проверяю...**", get_main_menu())
+        await update_or_send(user_id, "🔄 **Проверяю...**", get_main_menu())
         
         try:
             new_messages = await check_guerrilla_mail(account)
             if new_messages:
                 account.setdefault('messages', []).extend(new_messages)
-                await safe_edit(
+                await update_or_send(
                     user_id,
-                    f"✅ **Получено {len(new_messages)} писем!**\n\nНажмите ещё раз для просмотра",
+                    f"✅ **Получено {len(new_messages)} писем!**\n\nНажмите «Проверить почту» для просмотра",
                     get_main_menu()
                 )
             else:
                 total = len(account.get('messages', []))
-                await safe_edit(
+                await update_or_send(
                     user_id,
                     f"📭 **Новых писем нет**\n\nВсего: {total}",
                     get_main_menu()
                 )
         except Exception as e:
             logger.error(f"Check error: {e}")
-            await safe_edit(user_id, "❌ **Ошибка проверки**", get_main_menu())
+            await update_or_send(user_id, "❌ **Ошибка проверки**", get_main_menu())
     
     elif data.startswith("view_"):
         account = user_accounts.get(str(user_id))
         if not account:
-            await safe_edit(user_id, "❌ **Нет ящика**", get_main_menu())
+            await update_or_send(user_id, "❌ **Нет ящика**", get_main_menu())
             return
         
         messages = account.get('messages', [])
         if not messages:
-            await safe_edit(user_id, "📭 **Нет писем**", get_main_menu())
+            await update_or_send(user_id, "📭 **Нет писем**", get_main_menu())
             return
         
         text = f"📩 **Письма для `{account['email']}`:**\n\n"
@@ -292,15 +281,14 @@ async def handle_callbacks(callback: types.CallbackQuery):
             InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu")
         )
         
-        await safe_edit(user_id, text, keyboard)
+        await update_or_send(user_id, text, keyboard)
     
     elif data == "delete":
         account = user_accounts.get(str(user_id))
         if not account:
-            await safe_edit(user_id, "📭 **Нет ящика**", get_main_menu())
+            await update_or_send(user_id, "📭 **Нет ящика**", get_main_menu())
             return
         
-        # Удаляем ящик на сервере
         try:
             async with aiohttp.ClientSession() as session:
                 params = {
@@ -312,10 +300,10 @@ async def handle_callbacks(callback: types.CallbackQuery):
             pass
         
         del user_accounts[str(user_id)]
-        await safe_edit(user_id, f"🗑 **Ящик удалён**", get_main_menu())
+        await update_or_send(user_id, f"🗑 **Ящик удалён**", get_main_menu())
     
     elif data == "back_to_menu":
-        await safe_edit(user_id, "📧 **Главное меню**\n\nВыберите действие:", get_main_menu())
+        await update_or_send(user_id, "📧 **Главное меню**", get_main_menu())
 
 # ===== ФОНОВАЯ ПРОВЕРКА =====
 async def background_check():
@@ -326,13 +314,11 @@ async def background_check():
                     new_messages = await check_guerrilla_mail(account)
                     if new_messages:
                         account.setdefault('messages', []).extend(new_messages)
-                        # Отправляем уведомление в новом сообщении
                         await bot.send_message(
                             int(user_id),
                             f"📨 **Новое письмо!**\n\n"
                             f"От: {new_messages[0]['sender']}\n"
-                            f"Тема: {new_messages[0]['subject']}\n\n"
-                            f"Нажмите «Проверить почту»",
+                            f"Тема: {new_messages[0]['subject']}",
                             parse_mode='Markdown'
                         )
                 except:
@@ -341,33 +327,31 @@ async def background_check():
             pass
         await asyncio.sleep(30)
 
-# ===== ЗАПУСК =====
+# ===== ЗАПУСК (POLLING) =====
 async def main():
-    # Запускаем web сервер
+    # Запускаем web сервер для health check
     await start_web()
     
     # Запускаем фоновую проверку
     asyncio.create_task(background_check())
     logger.info("🔄 Mail checker started")
     
-    # Запускаем бота в режиме polling
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Webhook deleted")
-        
-        while True:
-            try:
-                await dp.start_polling(bot)
-                break
-            except Exception as e:
-                if "Conflict" in str(e):
-                    logger.warning("⚠️ Conflict, waiting 5 sec...")
-                    await asyncio.sleep(5)
-                else:
-                    logger.error(f"Polling error: {e}")
-                    await asyncio.sleep(5)
-    except Exception as e:
-        logger.error(f"Bot error: {e}")
+    # Удаляем webhook если был
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("✅ Webhook deleted, using polling")
+    
+    # Запускаем polling с защитой от конфликтов
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break
+        except Exception as e:
+            if "Conflict" in str(e):
+                logger.warning("⚠️ Conflict, waiting 5 sec...")
+                await asyncio.sleep(5)
+            else:
+                logger.error(f"Polling error: {e}")
+                await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
