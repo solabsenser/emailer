@@ -420,8 +420,11 @@ async def show_main_screen(user_id):
         )
         return
     
-    msg_count = len(account.get('messages', []))
-    codes = [m.get('code') for m in account.get('messages', []) if m.get('code')]
+    messages = account.get('messages', [])
+    # Фильтруем только словари
+    valid_messages = [m for m in messages if isinstance(m, dict)]
+    msg_count = len(valid_messages)
+    codes = [m.get('code') for m in valid_messages if m.get('code')]
     code_count = len(codes)
     
     text = f"📧 **Ваш ящик:**\n`{account['email']}`\n\n"
@@ -496,7 +499,10 @@ async def check_handler(message: types.Message):
             await save_user(user_id, account)
         
         messages = account.get('messages', [])
-        if not messages:
+        # Фильтруем только словари
+        valid_messages = [m for m in messages if isinstance(m, dict)]
+        
+        if not valid_messages:
             await send_bot_message(
                 user_id,
                 "📭 **Писем нет**\n\nНажмите «Назад»",
@@ -504,11 +510,11 @@ async def check_handler(message: types.Message):
             )
             return
         
-        text = f"📩 **Письма ({len(messages)}):**\n\n"
-        for i, msg in enumerate(messages[-10:][::-1], 1):
-            time = datetime.fromisoformat(msg['received_at']).strftime('%H:%M')
-            text += f"{i}. [{time}] **{msg['subject'][:35]}**\n"
-            text += f"   От: {msg['sender'][:30]}\n"
+        text = f"📩 **Письма ({len(valid_messages)}):**\n\n"
+        for i, msg in enumerate(valid_messages[-10:][::-1], 1):
+            time = datetime.fromisoformat(msg.get('received_at', datetime.now().isoformat())).strftime('%H:%M')
+            text += f"{i}. [{time}] **{msg.get('subject', '(no subject)')[:35]}**\n"
+            text += f"   От: {msg.get('sender', 'unknown')[:30]}\n"
             if msg.get('code'):
                 text += f"   🔑 Код: `{msg['code']}`\n"
             if msg.get('links'):
@@ -520,10 +526,10 @@ async def check_handler(message: types.Message):
                 text += f"   🔗 {link_preview}\n"
             text += "\n"
         
-        if len(messages) > 10:
-            text += f"... и еще {len(messages)-10} писем\n"
+        if len(valid_messages) > 10:
+            text += f"... и еще {len(valid_messages)-10} писем\n"
         
-        text += f"\n📌 **Всего:** {len(messages)}"
+        text += f"\n📌 **Всего:** {len(valid_messages)}"
         
         await send_bot_message(user_id, text, back_keyboard())
         
