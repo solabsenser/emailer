@@ -459,7 +459,9 @@ async def show_main_screen(user_id):
     if not account:
         await send_bot_message(
             user_id,
-            "📧 **Временная почта**\n\nСоздайте email для регистрации",
+            "📧 **Временная почта**\n\n"
+            "Моментальный email для регистрации.\n"
+            "Письма приходят сюда автоматически.",
             main_keyboard_no_account()
         )
         return
@@ -467,7 +469,7 @@ async def show_main_screen(user_id):
         account['messages'] = []
     valid_messages = [m for m in account['messages'] if isinstance(m, dict)]
     msg_count = len(valid_messages)
-    text = f"📧 **Ваш ящик:** `{account['email']}`\n\n📨 **Писем:** {msg_count}"
+    text = f"📧 **Ваш ящик**\n`{account['email']}`\n\n📨 {msg_count} писем"
     await send_bot_message(user_id, text, main_keyboard_with_account())
 
 @dp.message_handler(commands=['start'])
@@ -480,7 +482,9 @@ async def start(message: types.Message):
     else:
         await send_bot_message(
             user_id,
-            "👋 **Добро пожаловать!**\n\n📧 Временная почта\nСоздайте email для регистрации",
+            "📧 **Временная почта**\n\n"
+            "Моментальный email для регистрации.\n"
+            "Письма приходят сюда автоматически.",
             main_keyboard_no_account()
         )
 
@@ -584,7 +588,9 @@ async def delete_handler(message: types.Message):
         return
     await send_bot_message(
         user_id,
-        f"⚠️ **Удалить ящик?**\n\n`{account['email']}`\n\nВсе письма удалятся.",
+        f"⚠️ **Удалить ящик?**\n\n"
+        f"`{account['email']}`\n\n"
+        f"▸ Все письма будут удалены **безвозвратно**.",
         confirm_delete_keyboard()
     )
 
@@ -609,7 +615,7 @@ async def confirm_delete_handler(message: types.Message):
     await delete_user(user_id)
     await send_bot_message(
         user_id,
-        "🗑 **Ящик удалён**",
+        "🗑 **Ящик удалён**\n\nСоздайте новый при необходимости.",
         main_keyboard_no_account()
     )
 
